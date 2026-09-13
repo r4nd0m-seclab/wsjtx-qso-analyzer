@@ -1,0 +1,19 @@
+# Bytecode and runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Environment & local secrets
+.env
+*.env
+*credentials*.json
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
+
+# Secondary markdown files (keep only primary README.md)
+*.md
+!README.md

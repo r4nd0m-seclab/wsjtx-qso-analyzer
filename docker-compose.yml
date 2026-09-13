@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  wsjtx-qso-analyzer:
+    build: .
+    container_name: wsjtx-qso-analyzer
+    # Host networking allows direct receipt of WSJT-X UDP 2237 broadcasts without NAT translation
+    network_mode: host
+    environment:
+      - HTTP_PORT=8080
+      - UDP_PORT=2237
+      - HOME_GRID=EL09
+      - NORTH_OFFSET_DEG=0.0
+      - PATTERNS_DIR=/app/patterns
+    volumes:
+      - ./patterns:/app/patterns:ro
+      - ~/.local/share/WSJT-X:/wsjtx-data:ro
+    restart: unless-stopped

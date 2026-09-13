@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""
+WSJT-X QSO Analyzer (Web GUI & UDP Companion)
+Listens on WSJT-X UDP port 2237, scores incoming decodes against 3D antenna patterns
+and real-time space weather, resolves country and state codes, and provides a web dashboard on port 8080.
+"""
+
+import csv
+import io
+import json
+import math
+import os
+import re
+import socket
+import struct
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from typing import Dict, Tuple, List, Optional, Any
+
+# -----------------------------------------------------------------------------
+# Configuration Defaults
+# -----------------------------------------------------------------------------
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+UDP_PORT = int(os.environ.get("UDP_PORT", "2237"))
+DEFAULT_HOME_GRID = os.environ.get("HOME_GRID", "EL09")
+DEFAULT_TX_POWER_W = float(os.environ.get("TX_POWER_W", "100.0"))
+NORTH_OFFSET_DEG = float(os.environ.get("NORTH_OFFSET_DEG", "0.0"))
+PATTERNS_DIR = os.environ.get("PATTERNS_DIR", "patterns")
+DEFAULT_CQ_ONLY = os.environ.get("CQ_ONLY", "true").lower() in ("true", "1", "yes")
+DEFAULT_HIDE_WORKED = os.environ.get("HIDE_WORKED", "true").lower() in ("true", "1", "yes")
+WSJTX_DATA_DIR = os.environ.get("WSJTX_DATA_DIR", "/wsjtx-data")
+
+# -----------------------------------------------------------------------------
+# MMANA-GAL Antenna Gain Pattern & Multi-Band Manager
+# -----------------------------------------------------------------------------
+def get_band_name(freq_mhz: float) -> str:
+    if 1.8 <= freq_mhz <= 2.0: return "160m"
+    if 3.5 <= freq_mhz <= 4.0: return "80m"
+    if 5.3 <= freq_mhz <= 5.5: return "60m"
+    if 7.0 <= freq_mhz <= 7.3: return "40m"
+    if 10.1 <= freq_mhz <= 10.15: return "30m"
+    if 14.0 <= freq_mhz <= 14.35: return "20m"
+    if 18.068 <= freq_mhz <= 18.168: return "17m"
+    if 21.0 <= freq_mhz <= 21.45: return "15m"
+    if 24.89 <= freq_mhz <= 24.99: return "12m"
+    if 28.0 <= freq_mhz <= 29.7: return "10m"
+    if 50.0 <= freq_mhz <= 54.0: return "6m"
+    return f"{freq_mhz:.3f}MHz"
+
+def get_solar_band_group(freq_mhz: float) -> str:
+    """Maps dial frequency to solar.w5mmw.net band propagation ranges."""
+    if freq_mhz < 10.0:
+        return "80m-40m"
+    elif freq_mhz < 18.0:
+        return "30m-20m"
+    elif freq_mhz < 24.0:
+        return "17m-15m"
+    else:
+        return "12m-10m"
+
+class MmanaGainPattern:
+    def __init__(self, csv_path: str, north_offset_deg: float = 0.0):
+        self.csv_path = csv_path
+        self.north_offset = north_offset_deg
+        self.gain_grid: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+        self.max_gain = -999.0
+        self.peak_coord = (0, 0)
+        self.loaded = False
+        if os.path.exists(csv_path):
+            self._load(csv_path)
+
+    def _load(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                for row in reader:
+                    zenith = float(row[0])
+                    az = float(row[1])
+                    vert = float(row[2])
+                    hori = float(row[3])
+                    tot = float(row[4])
+                    
+                    elev = 90.0 - zenith
+                    if elev >= 0.0:
+                        az_idx = int(round(az)) % 360
+                        el_idx = int(round(elev))
+                        self.gain_grid[(az_idx, el_idx)] = (vert, hori, tot)
+                        if tot > self.max_gain:
+                            self.max_gain = tot
+                            self.peak_coord = (az_idx, el_idx)
+            self.loaded = True
+            print(f"[Antenna] Loaded {len(self.gain_grid)} points from {os.path.basename(path)}. Peak: {self.max_gain:.2f} dBi at Az {self.peak_coord[0]}°, El {self.peak_coord[1]}°")
+        except Exception as e:
+            print(f"[Antenna] Failed to load pattern from {path}: {e}")
+
+    def get_gain(self, azimuth_deg: float, elevation_deg: float) -> Tuple[float, float, float]:
+        if not self.loaded:
+            return (0.0, 0.0, 0.0)
+        az_eff = int(round(azimuth_deg - self.north_offset)) % 360
+        el_eff = int(round(max(0.0, min(90.0, elevation_deg))))
+        return self.gain_grid.get((az_eff, el_eff), (-30.0, -30.0, -30.0))
+
+    def get_azimuth_slice(self, elevation_deg: float) -> List[float]:
+        """Returns 360 total gain values for polar plot at a given elevation."""
+        el_eff = int(round(max(0.0, min(90.0, elevation_deg))))
+        slice_vals = []
+        for az in range(360):
+            az_eff = int(round(az - self.north_offset)) % 360
+            tot = self.gain_grid.get((az_eff, el_eff), (-30.0, -30.0, -30.0))[2]
+            slice_vals.append(round(tot, 2))
+        return slice_vals
+
+class AntennaPatternManager:
+    """Manages multi-band MMANA-GAL pattern files dynamically matched to WSJT-X dial frequency."""
+    def __init__(self, patterns_dir: str, north_offset_deg: float = 0.0):
+        self.patterns_dir = patterns_dir
+        self.north_offset = north_offset_deg
+        self.patterns_cache: Dict[str, MmanaGainPattern] = {}
+        self.file_map: Dict[float, str] = {} # nominal_freq_mhz -> full_path
+        self.active_pattern: Optional[MmanaGainPattern] = None
+        self.active_filename: str = ""
+        self.active_freq_mhz: float = 0.0
+        self.active_band_name: str = ""
+        self.scan_patterns()
+
+    def scan_patterns(self):
+        self.file_map.clear()
+        if not os.path.exists(self.patterns_dir):
+            print(f"[PatternManager] Directory not found: {self.patterns_dir}")
+            return
+
+        for entry in os.listdir(self.patterns_dir):
+            if entry.lower().endswith(".csv"):
+                m = re.match(r'^([0-9]+(?:\.[0-9]+)?)\.csv$', entry, re.IGNORECASE)
+                if m:
+                    f_mhz = float(m.group(1))
+                    self.file_map[f_mhz] = os.path.join(self.patterns_dir, entry)
+
+        print(f"[PatternManager] Discovered {len(self.file_map)} band pattern files in {self.patterns_dir}: {sorted(self.file_map.keys())} MHz")
+
+    def set_frequency(self, freq_mhz: float) -> bool:
+        """Selects and activates the best matching pattern file for the given dial frequency."""
+        if not self.file_map:
+            self.scan_patterns()
+        if not self.file_map:
+            return False
+
+        best_nominal = min(self.file_map.keys(), key=lambda f: abs(f - freq_mhz))
+        target_path = self.file_map[best_nominal]
+        filename = os.path.basename(target_path)
+
+        if self.active_filename == filename and self.active_pattern is not None:
+            return False # Already active
+
+        if filename not in self.patterns_cache:
+            self.patterns_cache[filename] = MmanaGainPattern(target_path, self.north_offset)
+
+        self.active_pattern = self.patterns_cache[filename]
+        self.active_filename = filename
+        self.active_freq_mhz = best_nominal
+        self.active_band_name = get_band_name(best_nominal)
+        print(f"[PatternManager] Switched active antenna pattern -> {filename} ({self.active_band_name}) for {freq_mhz:.3f} MHz (Peak: {self.active_pattern.max_gain:.2f} dBi)")
+        return True
+
+# -----------------------------------------------------------------------------
+# WSJT-X Log Watcher (Worked Before / B4 Tracking)
+# -----------------------------------------------------------------------------
+class WsjtxLogWatcher:
+    """Monitors and parses WSJT-X log file (wsjtx.log) to track worked-before stations."""
+    def __init__(self, log_path: Optional[str] = None):
+        self.log_path = log_path or self._detect_log_path()
+        self.last_mtime: float = 0.0
+        self.worked_any: Dict[str, List[Dict[str, Any]]] = {} # call -> list of qsos
+        self.worked_band: Dict[Tuple[str, str], Dict[str, Any]] = {} # (call, band) -> qso
+        self.reload_if_changed()
+
+    def _detect_log_path(self) -> str:
+        candidates = [
+            os.environ.get("WSJTX_LOG_PATH", ""),
+            os.path.join(WSJTX_DATA_DIR, "wsjtx.log"),
+            "/wsjtx-data/wsjtx.log",
+            os.path.expanduser("~/.local/share/WSJT-X/wsjtx.log"),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
+        return os.path.join(WSJTX_DATA_DIR, "wsjtx.log")
+
+    def reload_if_changed(self) -> bool:
+        if not self.log_path or not os.path.exists(self.log_path):
+            detected = self._detect_log_path()
+            if detected and os.path.exists(detected):
+                self.log_path = detected
+            else:
+                return False
+
+        try:
+            mtime = os.path.getmtime(self.log_path)
+            if mtime == self.last_mtime:
+                return False
+
+            self.last_mtime = mtime
+            w_any = {}
+            w_band = {}
+
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 8:
+                        date_off = row[2].strip()
+                        time_off = row[3].strip()
+                        call = row[4].strip().upper()
+                        grid = row[5].strip().upper()
+                        try:
+                            freq_mhz = float(row[6].strip())
+                        except ValueError:
+                            freq_mhz = 0.0
+                        mode = row[7].strip()
+                        band = get_band_name(freq_mhz)
+
+                        if call:
+                            qso = {
+                                "date": date_off,
+                                "time": time_off,
+                                "grid": grid,
+                                "freq": freq_mhz,
+                                "band": band,
+                                "mode": mode
+                            }
+                            if call not in w_any:
+                                w_any[call] = []
+                            w_any[call].append(qso)
+                            w_band[(call, band)] = qso
+
+            self.worked_any = w_any
+            self.worked_band = w_band
+            print(f"[LogWatcher] Loaded {len(w_any)} unique stations ({len(w_band)} band-slots) from {self.log_path}")
+            return True
+        except Exception as e:
+            print(f"[LogWatcher] Error reading {self.log_path}: {e}")
+            return False
+
+    def check_worked(self, call: str, current_band: str) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
+        """Returns (worked_current_band, worked_any_band, last_qso)."""
+        self.reload_if_changed()
+        call_clean = call.strip().upper()
+        base_call = call_clean.split("/")[0] if "/" in call_clean else call_clean
+
+        qso_band = self.worked_band.get((call_clean, current_band))
+        if not qso_band and base_call != call_clean:
+            qso_band = self.worked_band.get((base_call, current_band))
+
+        qsos_any = self.worked_any.get(call_clean)
+        if not qsos_any and base_call != call_clean:
+            qsos_any = self.worked_any.get(base_call)
+
+        last_qso = qso_band or (qsos_any[-1] if qsos_any else None)
+        return bool(qso_band), bool(qsos_any), last_qso
+
+# -----------------------------------------------------------------------------
+# Country & State Code Resolver (DXCC & Maidenhead Grid Mapping)
+# -----------------------------------------------------------------------------
+class LocationResolver:
+    """Resolves Country, DXCC entity, and US/Canadian State/Province codes from callsign and Maidenhead grid."""
+    def __init__(self, cty_path: Optional[str] = None, grids_path: Optional[str] = None):
+        self.grids_map: Dict[str, Dict[str, str]] = {}
+        self.entities: Dict[str, Dict[str, Any]] = {}
+        self.prefix_map: Dict[str, Dict[str, Any]] = {}
+        self.exact_map: Dict[str, Dict[str, Any]] = {}
+        
+        # Determine grids path
+        grids_file = grids_path or os.environ.get("GRIDS_PATH", "")
+        if not grids_file or not os.path.exists(grids_file):
+            for candidate in [
+                "grids_na.json",
+                "/app/grids_na.json",
+                os.path.join(os.path.dirname(__file__), "grids_na.json")
+            ]:
+                if os.path.exists(candidate):
+                    grids_file = candidate
+                    break
+
+        if grids_file and os.path.exists(grids_file):
+            try:
+                with open(grids_file, "r", encoding="utf-8") as f:
+                    self.grids_map = json.load(f)
+                print(f"[Location] Loaded {len(self.grids_map)} North American grid squares from {grids_file}")
+            except Exception as e:
+                print(f"[Location] Error loading grids map {grids_file}: {e}")
+
+        # Determine cty.dat path
+        cty_file = cty_path or os.environ.get("CTY_DAT_PATH", "")
+        if not cty_file or not os.path.exists(cty_file):
+            for candidate in [
+                "cty.dat",
+                "/app/cty.dat",
+                os.path.join(os.path.dirname(__file__), "cty.dat"),
+                "/usr/share/wsjtx/cty.dat",
+                os.path.expanduser("~/local/wsjtx/cty.dat"),
+                os.path.expanduser("~/.local/share/WSJT-X/cty.dat")
+            ]:
+                if os.path.exists(candidate):
+                    cty_file = candidate
+                    break
+
+        if cty_file and os.path.exists(cty_file):
+            try:
+                self._load_cty(cty_file)
+                print(f"[Location] Loaded {len(self.entities)} DXCC entities, {len(self.prefix_map)} prefixes from {cty_file}")
+            except Exception as e:
+                print(f"[Location] Error parsing {cty_file}: {e}")
+
+    def _map_to_iso(self, pfx: str, name: str) -> str:
+        table = {
+            'K': 'US', 'VE': 'CA', 'XE': 'MX', 'JA': 'JP', 'DL': 'DE', 'G': 'GB',
+            'GM': 'GB', 'GW': 'GB', 'GI': 'GB', 'GD': 'GB', 'GJ': 'GB', 'GU': 'GB',
+            'VK': 'AU', 'ZL': 'NZ', 'PY': 'BR', 'LU': 'AR', 'CE': 'CL', 'CX': 'UY',
+            'OA': 'PE', 'HC': 'EC', 'HK': 'CO', 'YV': 'VE', 'ZP': 'PY', 'CP': 'BO',
+            'EA': 'ES', 'EA8': 'ES', 'EA9': 'ES', 'I': 'IT', 'IS0': 'IT', 'F': 'FR',
+            'OH': 'FI', 'OH0': 'AX', 'SM': 'SE', 'LA': 'NO', 'PA': 'NL', 'ON': 'BE',
+            'SP': 'PL', 'OK': 'CZ', 'OM': 'SK', 'HA': 'HU', 'YO': 'RO', 'LZ': 'BG',
+            'SV': 'GR', 'SV5': 'GR', 'SV9': 'GR', 'UR': 'UA', 'UA': 'RU', 'UA9': 'RU',
+            'BY': 'CN', 'HL': 'KR', 'BV': 'TW', 'VR': 'HK', 'HS': 'TH', '9V': 'SG',
+            'YB': 'ID', '9M2': 'MY', '9M6': 'MY', 'DU': 'PH', 'VU': 'IN', '4X': 'IL',
+            'ZS': 'ZA', 'KL': 'US', 'KH6': 'US', 'KP4': 'PR', 'KP2': 'VI', 'KH2': 'GU',
+            'KH0': 'MP', 'TI': 'CR', 'HP': 'PA', 'YS': 'SV', 'TG': 'GT', 'HR': 'HN',
+            'YN': 'NI', 'ZF': 'KY', 'HI': 'DO', 'CO': 'CU', 'C6': 'BS', 'FP': 'PM',
+            'TF': 'IS', 'OY': 'FO', 'OX': 'GL', 'ER': 'MD', 'EW': 'BY', 'ES': 'EE',
+            'YL': 'LV', 'LY': 'LT', 'OE': 'AT', 'HB': 'CH', 'HB0': 'LI', 'CT': 'PT',
+            'CU': 'PT', 'CT3': 'PT', 'TA': 'TR', 'EK': 'AM', '4L': 'GE', '4J': 'AZ',
+            'UN': 'KZ', 'EX': 'KG', 'EY': 'TJ', 'UK': 'UZ', 'EZ': 'TM', 'JT': 'MN',
+            'A6': 'AE', 'A7': 'QA', 'A9': 'BH', '9K': 'KW', 'HZ': 'SA', '7X': 'DZ',
+            'CN': 'MA', '3V': 'TN', '5A': 'LY', 'SU': 'EG', '5Z': 'KE', '5N': 'NG'
+        }
+        if pfx in table:
+            return table[pfx]
+        m = re.match(r'^[A-Z]{1,2}', pfx)
+        return m.group(0) if m else pfx
+
+    def _load_cty(self, path: str):
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        records = content.split(';')
+        for rec in records:
+            rec = rec.strip()
+            if not rec:
+                continue
+            lines = [line.strip() for line in rec.splitlines() if line.strip()]
+            if not lines:
+                continue
+            parts = [p.strip() for p in lines[0].split(':')]
+            if len(parts) < 8:
+                continue
+            name = parts[0]
+            cq = int(parts[1]) if parts[1].isdigit() else 0
+            itu = int(parts[2]) if parts[2].isdigit() else 0
+            continent = parts[3]
+            primary_pfx = parts[7]
+
+            pfx_str = ' '.join(lines[1:])
+            pfx_list = [p.strip() for p in pfx_str.split(',') if p.strip()]
+            iso = self._map_to_iso(primary_pfx, name)
+
+            ent = {
+                'name': name,
+                'primary_pfx': primary_pfx,
+                'iso': iso,
+                'continent': continent,
+                'cq': cq,
+                'itu': itu
+            }
+            self.entities[primary_pfx] = ent
+
+            for p in pfx_list:
+                clean_p = re.sub(r'[\(\[\<\{].*?[\)\]\>\}]', '', p).strip()
+                if not clean_p:
+                    continue
+                if clean_p.startswith('='):
+                    self.exact_map[clean_p[1:]] = ent
+                else:
+                    self.prefix_map[clean_p] = ent
+
+    def resolve(self, call: str, grid: str) -> Dict[str, Any]:
+        call_clean = call.strip().upper()
+        base_call = call_clean.split('/')[0] if '/' in call_clean else call_clean
+        grid_4 = grid.strip().upper()[:4] if grid else ''
+
+        # 1. Look up DXCC entity from exact or prefix
+        ent = self.exact_map.get(call_clean) or self.exact_map.get(base_call)
+        if not ent:
+            for length in range(len(base_call), 0, -1):
+                p = base_call[:length]
+                if p in self.prefix_map:
+                    ent = self.prefix_map[p]
+                    break
+
+        country_name = ent['name'] if ent else 'Unknown'
+        country_code = ent['iso'] if ent else ''
+        primary_pfx = ent['primary_pfx'] if ent else ''
+
+        # 2. Check North American State/Province mapping from grid
+        grid_info = self.grids_map.get(grid_4)
+        state_code = ''
+        state_name = ''
+
+        if grid_info:
+            g_country = grid_info.get('country', '')
+            g_state = grid_info.get('state', '')
+            g_name = grid_info.get('name', '')
+            if country_code in ('US', 'CA') or not country_code:
+                country_code = g_country
+                country_name = 'United States' if g_country == 'US' else 'Canada'
+                state_code = g_state
+                state_name = g_name
+
+        # Fallback for US states if grid wasn't in grids_map but call is US
+        if country_code == 'US' and not state_code:
+            if base_call.startswith(('KL', 'AL', 'NL', 'WL')):
+                state_code, state_name = 'AK', 'Alaska'
+            elif base_call.startswith(('KH6', 'AH6', 'NH6', 'WH6')):
+                state_code, state_name = 'HI', 'Hawaii'
+            elif base_call.startswith(('KP4', 'NP4', 'WP4')):
+                state_code, state_name = 'PR', 'Puerto Rico'
+            elif base_call.startswith(('KP2', 'NP2', 'WP2')):
+                state_code, state_name = 'VI', 'Virgin Islands'
+
+        # Location presentation fields
+        if state_code:
+            loc_code = state_code
+            loc_sub = 'USA' if country_code == 'US' else ('CAN' if country_code == 'CA' else country_code)
+            loc_full = f"{state_name}, {country_name}"
+            is_dx = False
+        else:
+            loc_code = country_code or primary_pfx or 'DX'
+            loc_sub = country_name
+            loc_full = country_name
+            is_dx = (country_code != 'US')
+
+        return {
+            'country': country_name,
+            'country_code': country_code,
+            'state': state_name,
+            'state_code': state_code,
+            'loc_code': loc_code,
+            'loc_sub': loc_sub,
+            'loc_full': loc_full,
+            'is_dx': is_dx
+        }
+
+# -----------------------------------------------------------------------------
+# Space Weather Service
+# -----------------------------------------------------------------------------
+class SpaceWeather:
+    @staticmethod
+    def fetch() -> Dict[str, Any]:
+        url = "https://solar.w5mmw.net/"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HamRadioTool/1.0"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8")
+        except Exception as e:
+            return {
+                "source": "fallback (offline)",
+                "solar_flux": 100.0,
+                "sunspot_number": 75,
+                "kp_index": 2.0,
+                "a_index": 7,
+                "geomagnetic_storm": "Quiet",
+                "solar_wind_km_s": 400.0,
+                "noise_floor": "S0-S1",
+                "x_ray": "B1.0",
+                "bands": {"30m-20m": {"day": "Good", "night": "Good"}},
+                "updated_utc": datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            }
+
+        res: Dict[str, Any] = {"source": "https://solar.w5mmw.net/"}
+        rows = re.findall(
+            r'<div class="cond_row"><dt>(.*?)</dt><dd class="cond_value">(.*?)</dd></div>',
+            html
+        )
+        raw_map = {}
+        for dt, val in rows:
+            clean_dt = re.sub(r'<[^>]+>', '', dt).strip()
+            clean_val = re.sub(r'<[^>]+>', '', val).strip()
+            raw_map[clean_dt] = clean_val
+
+        def parse_float(v, default=0.0):
+            m = re.search(r'[-+]?\d*\.?\d+', str(v))
+            return float(m.group(0)) if m else default
+
+        def parse_int(v, default=0):
+            m = re.search(r'[-+]?\d+', str(v))
+            return int(m.group(0)) if m else default
+
+        res["solar_flux"] = parse_float(raw_map.get("Solar Flux", 100))
+        res["sunspot_number"] = parse_int(raw_map.get("Sunspot Number", 70))
+        res["kp_index"] = parse_float(raw_map.get("Kp-Index", 2.0))
+        res["a_index"] = parse_int(raw_map.get("A-Index", 5))
+        res["geomagnetic_storm"] = raw_map.get("Geomagnetic Storm", "Quiet")
+        res["solar_wind_km_s"] = parse_float(raw_map.get("Solar Wind", 400.0))
+        res["noise_floor"] = raw_map.get("Noise Floor", "S0-S1")
+        res["x_ray"] = raw_map.get("X-Ray", "B1.0")
+
+        bands = {}
+        band_rows = re.findall(
+            r'<tr>\s*<th scope="row">([^<]+)</th>\s*<td><span[^>]*>([^<]+)</span></td>\s*<td><span[^>]*>([^<]+)</span></td>',
+            html
+        )
+        for b, day, night in band_rows:
+            bands[b.strip()] = {"day": day.strip(), "night": night.strip()}
+        res["bands"] = bands
+        res["updated_utc"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        return res
+
+# -----------------------------------------------------------------------------
+# RF & Propagation Math
+# -----------------------------------------------------------------------------
+def maidenhead_to_latlon(grid: str) -> Tuple[float, float]:
+    grid = grid.strip().upper()
+    lon = (ord(grid[0]) - ord('A')) * 20.0 - 180.0 + 10.0
+    lat = (ord(grid[1]) - ord('A')) * 10.0 - 90.0 + 5.0
+    if len(grid) >= 4:
+        lon += (ord(grid[2]) - ord('0')) * 2.0 - 10.0 + 1.0
+        lat += (ord(grid[3]) - ord('0')) * 1.0 - 5.0 + 0.5
+    if len(grid) >= 6:
+        lon += (ord(grid[4]) - ord('A')) * (2.0 / 24.0) - 1.0 + (1.0 / 24.0)
+        lat += (ord(grid[5]) - ord('A')) * (1.0 / 24.0) - 0.5 + (0.5 / 24.0)
+    return lat, lon
+
+def great_circle(lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, float]:
+    r_earth = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2.0)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0)**2
+    dist_km = r_earth * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    bearing_deg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    return dist_km, bearing_deg
+
+def solar_elevation(lat_deg: float, lon_deg: float, dt_utc: datetime) -> float:
+    day_of_year = dt_utc.timetuple().tm_yday
+    utc_hours = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+    N = day_of_year + utc_hours / 24.0
+    delta_deg = 23.44 * math.sin(math.radians((360.0 / 365.25) * (N - 80.0)))
+    delta = math.radians(delta_deg)
+    b_rad = math.radians((360.0 / 365.25) * (N - 81.0))
+    e_min = 9.87 * math.sin(2.0 * b_rad) - 7.53 * math.cos(b_rad) - 1.5 * math.sin(b_rad)
+    solar_time_hours = utc_hours + (lon_deg / 15.0) + (e_min / 60.0)
+    hour_angle_deg = (solar_time_hours - 12.0) * 15.0
+    lat_rad = math.radians(lat_deg)
+    sin_elev = math.sin(lat_rad) * math.sin(delta) + math.cos(lat_rad) * math.cos(delta) * math.cos(math.radians(hour_angle_deg))
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+def estimate_elevation(dist_km: float, virtual_height_km: float = 300.0) -> Tuple[float, int]:
+    r_earth = 6371.0
+    hops = max(1, math.ceil(dist_km / 3000.0))
+    hop_dist = dist_km / hops
+    psi = hop_dist / (2.0 * r_earth)
+    tan_elev = (math.cos(psi) - (r_earth / (r_earth + virtual_height_km))) / math.sin(psi)
+    elev_deg = math.degrees(math.atan(tan_elev))
+    return max(1.0, min(90.0, elev_deg)), hops
+
+def ft8_decode_probability(snr_db: float, snr_threshold: float = -21.0, slope: float = 0.8) -> float:
+    margin = snr_db - snr_threshold
+    return 1.0 / (1.0 + math.exp(-slope * margin))
+
+def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], bool]:
+    """Extracts callsign, 4-char grid square, and is_cq flag from FT8 messages."""
+    msg = message.strip()
+    tokens = msg.split()
+    # CQ forms: "CQ K7DUR DM42", "CQ DX KD9XX EN52", "CQ NA ...", "QRZ K7DUR DM42"
+    if len(tokens) >= 3 and tokens[0] in ("CQ", "QRZ"):
+        if len(tokens) == 3:
+            call, grid = tokens[1], tokens[2]
+        else: # e.g. CQ DX KD9XX EN52 or CQ NA ...
+            call, grid = tokens[2], tokens[3]
+        if re.match(r'^[A-R]{2}[0-9]{2}$', grid.upper()) and grid.upper() != "RR73":
+            return call, grid.upper(), True
+    elif len(tokens) >= 3:
+        # Station-to-station exchange: e.g. K6VVK W7AJP DM09
+        call, grid = tokens[1], tokens[2]
+        if re.match(r'^[A-R]{2}[0-9]{2}$', grid.upper()) and grid.upper() != "RR73":
+            return call, grid.upper(), False
+    return None, None, False
+
+# -----------------------------------------------------------------------------
+# Application State
+# -----------------------------------------------------------------------------
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.wsjt_connected = False
+        self.last_heartbeat_time = 0.0
+        self.dial_freq_hz = 14074000
+        self.mode = "FT8"
+        self.de_call = "W5KARS"
+        self.de_grid = DEFAULT_HOME_GRID
+        self.dx_call = ""
+        self.dx_grid = ""
+        self.transmitting = False
+        self.decoding = False
+        self.tx_enabled = False
+        self.cq_only = DEFAULT_CQ_ONLY
+        self.hide_worked = DEFAULT_HIDE_WORKED
+        self.wsjt_client_id = "WSJT-X"
+        self.wsjt_remote_addr: Optional[Tuple[str, int]] = None
+        
+        self.solar: Dict[str, Any] = {}
+        self.decodes: Dict[str, Dict[str, Any]] = {} # keyed by callsign
+        self.pattern_manager: Optional[AntennaPatternManager] = None
+        self.log_watcher: Optional[WsjtxLogWatcher] = None
+        self.loc_resolver: LocationResolver = LocationResolver()
+
+state = State()
+
+# -----------------------------------------------------------------------------
+# WSJT-X UDP Serialization & Listener
+# -----------------------------------------------------------------------------
+def decode_utf8(data: bytes, offset: int) -> Tuple[str, int]:
+    if offset + 4 > len(data):
+        return "", offset
+    length = struct.unpack_from(">I", data, offset)[0]
+    offset += 4
+    if length == 0xffffffff or offset + length > len(data):
+        return "", offset
+    s = data[offset:offset+length].decode("utf-8", errors="replace")
+    offset += length
+    return s, offset
+
+def encode_utf8(s: Optional[str]) -> bytes:
+    if s is None:
+        return struct.pack(">I", 0xffffffff)
+    b = s.encode("utf-8")
+    return struct.pack(">I", len(b)) + b
+
+def build_wsjt_reply_packet(target_id: str, qtime_ms: int, snr: int, delta_time: float,
+                            delta_freq: int, mode: str, message: str, low_conf: bool = False,
+                            modifiers: int = 0) -> bytes:
+    magic = 0xadbccbda
+    schema = 3
+    msg_type = 4 # Reply
+    pkt = struct.pack(">III", magic, schema, msg_type)
+    pkt += encode_utf8(target_id)
+    pkt += struct.pack(">I", qtime_ms)
+    pkt += struct.pack(">i", snr)
+    pkt += struct.pack(">d", float(delta_time))
+    pkt += struct.pack(">I", delta_freq)
+    pkt += encode_utf8(mode)
+    pkt += encode_utf8(message)
+    pkt += struct.pack("?B", low_conf, modifiers)
+    return pkt
+
+def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, message: str):
+    call, grid, is_cq = extract_call_and_grid(message)
+    if not call or not grid:
+        return
+
+    with state.lock:
+        home_grid = state.de_grid or DEFAULT_HOME_GRID
+        pattern = state.pattern_manager.active_pattern if state.pattern_manager else None
+        current_band = state.pattern_manager.active_band_name if state.pattern_manager else "20m"
+        kp = state.solar.get("kp_index", 2.0)
+        log_watcher = state.log_watcher
+        loc_resolver = state.loc_resolver
+        
+    home_lat, home_lon = maidenhead_to_latlon(home_grid)
+    rem_lat, rem_lon = maidenhead_to_latlon(grid)
+    dist_km, az_deg = great_circle(home_lat, home_lon, rem_lat, rem_lon)
+    
+    mid_lat = (home_lat + rem_lat) / 2.0
+    mid_lon = (home_lon + rem_lon) / 2.0
+    now_utc = datetime.now(timezone.utc)
+    mid_sun_el = solar_elevation(mid_lat, mid_lon, now_utc)
+    path_state = "DAY" if mid_sun_el > 0 else ("TWILIGHT" if mid_sun_el > -12 else "NIGHT")
+    
+    hv_km = 280.0 if path_state == "DAY" else (310.0 if path_state == "TWILIGHT" else 350.0)
+    el_deg, hops = estimate_elevation(dist_km, virtual_height_km=hv_km)
+    
+    v_dbi, h_dbi, tot_dbi = pattern.get_gain(az_deg, el_deg) if pattern else (0.0, 0.0, 0.0)
+    
+    # Resolve Country & State
+    loc = loc_resolver.resolve(call, grid) if loc_resolver else {
+        "country": "Unknown", "country_code": "", "state": "", "state_code": "",
+        "loc_code": "--", "loc_sub": "", "loc_full": "", "is_dx": False
+    }
+
+    # Check if worked before
+    worked_band, worked_any, last_qso = (
+        log_watcher.check_worked(call, current_band) if log_watcher else (False, False, None)
+    )
+    
+    # Geomagnetic loss for high latitude if Kp > 2
+    geomag_loss_db = 0.0
+    if kp > 2.0 and rem_lat > 45.0:
+        geomag_loss_db = (kp - 2.0) * (rem_lat - 45.0) * 0.15
+        
+    rx_margin = snr - (-21.0)
+    
+    # Effective link margin combining SNR above decode threshold, antenna gain pattern, and geomagnetic loss
+    effective_margin = rx_margin + tot_dbi - geomag_loss_db
+    
+    # Normalized score based on link margin (baseline 50 at 0 dB margin, scale to 100)
+    score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5)))
+    if worked_band:
+        # Heavily penalize priority for stations already worked on this band
+        score = score * 0.35
+        rec = "WORKED B4"
+    else:
+        rec = "EXCELLENT" if score >= 80 else ("GOOD" if score >= 60 else "MARGINAL")
+
+    entry = {
+        "call": call,
+        "grid": grid,
+        "country": loc["country"],
+        "country_code": loc["country_code"],
+        "state": loc["state"],
+        "state_code": loc["state_code"],
+        "loc_code": loc["loc_code"],
+        "loc_sub": loc["loc_sub"],
+        "loc_full": loc["loc_full"],
+        "is_dx": loc["is_dx"],
+        "message": message,
+        "snr": snr,
+        "df": df,
+        "dt": round(dt, 2),
+        "dist_km": round(dist_km),
+        "dist_mi": round(dist_km * 0.621371),
+        "az": round(az_deg, 1),
+        "el": round(el_deg, 1),
+        "gain": round(tot_dbi, 2),
+        "rx_margin": round(rx_margin, 1),
+        "path_state": path_state,
+        "hv_km": round(hv_km),
+        "score": round(score, 1),
+        "rec": rec,
+        "is_cq": is_cq,
+        "worked_band": worked_band,
+        "worked_any": worked_any,
+        "last_qso": last_qso,
+        "qtime_ms": qtime_ms,
+        "mode": mode,
+        "timestamp": time.time()
+    }
+
+    with state.lock:
+        state.decodes[call] = entry
+
+def udp_listener_thread():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", UDP_PORT))
+        print(f"[UDP] Listening for WSJT-X on 0.0.0.0:{UDP_PORT}")
+    except Exception as e:
+        print(f"[UDP] Bind error on port {UDP_PORT}: {e}")
+        return
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(8192)
+            if len(data) < 12:
+                continue
+            magic, schema, msg_type = struct.unpack_from(">III", data, 0)
+            if magic != 0xadbccbda:
+                continue
+
+            with state.lock:
+                state.wsjt_connected = True
+                state.last_heartbeat_time = time.time()
+                state.wsjt_remote_addr = addr
+
+            off = 12
+            client_id, off = decode_utf8(data, off)
+            with state.lock:
+                if client_id:
+                    state.wsjt_client_id = client_id
+
+            if msg_type == 1: # Status
+                if off + 8 <= len(data):
+                    dial_freq = struct.unpack_from(">Q", data, off)[0]; off += 8
+                    mode, off = decode_utf8(data, off)
+                    dx_call, off = decode_utf8(data, off)
+                    rpt, off = decode_utf8(data, off)
+                    tx_mode, off = decode_utf8(data, off)
+                    if off + 3 <= len(data):
+                        tx_en, xmit, dec = struct.unpack_from("???", data, off); off += 3
+                        rx_df, tx_df = struct.unpack_from(">II", data, off); off += 8
+                        de_call, off = decode_utf8(data, off)
+                        de_grid, off = decode_utf8(data, off)
+                        dx_grid, off = decode_utf8(data, off)
+                        with state.lock:
+                            old_band = get_band_name(state.dial_freq_hz / 1e6) if state.dial_freq_hz > 0 else ""
+                            new_band = get_band_name(dial_freq / 1e6)
+                            freq_changed = (state.dial_freq_hz != dial_freq)
+                            band_changed = (old_band != new_band and bool(old_band))
+                            state.dial_freq_hz = dial_freq
+                            state.mode = mode
+                            if de_call: state.de_call = de_call
+                            if de_grid: state.de_grid = de_grid
+                            state.dx_call = dx_call
+                            state.dx_grid = dx_grid
+                            state.tx_enabled = tx_en
+                            state.transmitting = xmit
+                            state.decoding = dec
+                            if band_changed:
+                                state.decodes.clear()
+                            if state.pattern_manager and (freq_changed or state.pattern_manager.active_pattern is None):
+                                state.pattern_manager.set_frequency(dial_freq / 1e6)
+
+            elif msg_type == 2: # Decode
+                if off < len(data):
+                    is_new = struct.unpack_from("?", data, off)[0]; off += 1
+                    qtime_ms = struct.unpack_from(">I", data, off)[0]; off += 4
+                    snr = struct.unpack_from(">i", data, off)[0]; off += 4
+                    dt = struct.unpack_from(">d", data, off)[0]; off += 8
+                    df = struct.unpack_from(">I", data, off)[0]; off += 4
+                    mode, off = decode_utf8(data, off)
+                    message, off = decode_utf8(data, off)
+                    process_decode(qtime_ms, snr, dt, df, mode, message)
+
+            elif msg_type == 3: # Clear
+                with state.lock:
+                    state.decodes.clear()
+
+        except Exception as e:
+            time.sleep(0.01)
+
+# -----------------------------------------------------------------------------
+# Background Space Weather Poller
+# -----------------------------------------------------------------------------
+def space_weather_poller():
+    while True:
+        try:
+            sw = SpaceWeather.fetch()
+            with state.lock:
+                state.solar = sw
+            print(f"[SpaceWeather] Updated: SFI={sw.get('solar_flux')}, Kp={sw.get('kp_index')}, Wind={sw.get('solar_wind_km_s')} km/s")
+        except Exception as e:
+            print(f"[SpaceWeather] Error: {e}")
+        time.sleep(1800) # update every 30 minutes
+
+# -----------------------------------------------------------------------------
+# Web Request Handler & REST API
+# -----------------------------------------------------------------------------
+class DashboardHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Suppress noisy HTTP GET logging to console
+        pass
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            with open("index.html", "rb") as f:
+                self.wfile.write(f.read())
+            return
+
+        elif self.path == "/favicon.ico":
+            svg = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M16 8v20M10 28l6-12 6 12M12 24h8" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="16" cy="8" r="2.5" fill="#38bdf8"/><path d="M11 5a7 7 0 0 0 0 6M21 5a7 7 0 0 1 0 6" stroke="#34d399" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M7 2a13 13 0 0 0 0 12M25 2a13 13 0 0 1 0 12" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" fill="none"/></svg>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.end_headers()
+            self.wfile.write(svg)
+            return
+            
+        elif self.path == "/api/state":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            
+            with state.lock:
+                # Disconnect watchdog if no packets for 15s
+                is_connected = (time.time() - state.last_heartbeat_time < 20.0) if state.last_heartbeat_time > 0 else False
+                
+                # Prune decodes older than 6 minutes (24 FT8 cycles)
+                now = time.time()
+                pruned = {k: v for k, v in state.decodes.items() if now - v["timestamp"] < 360}
+                state.decodes = pruned
+                
+                ranked_list = list(state.decodes.values())
+                ranked_list.sort(key=lambda x: x["score"], reverse=True)
+                
+                active_pat = state.pattern_manager.active_pattern if state.pattern_manager else None
+                pattern_slice = active_pat.get_azimuth_slice(15.0) if active_pat else []
+                peak_gain = active_pat.max_gain if active_pat else 0.0
+                pattern_file = state.pattern_manager.active_filename if state.pattern_manager else "None"
+                band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
+                nominal_mhz = state.pattern_manager.active_freq_mhz if state.pattern_manager else 0.0
+
+                freq_mhz = round(state.dial_freq_hz / 1e6, 3)
+                current_band = band_name or get_band_name(freq_mhz)
+                solar_group = get_solar_band_group(freq_mhz)
+                solar_bands = state.solar.get("bands", {}) if state.solar else {}
+                band_cond = solar_bands.get(solar_group, {"day": "--", "night": "--"})
+
+                solar_payload = dict(state.solar) if state.solar else {}
+                solar_payload["active_band"] = current_band
+                solar_payload["active_group"] = solar_group
+                solar_payload["active_condition"] = band_cond
+
+                payload = {
+                    "connected": is_connected,
+                    "dial_freq_hz": state.dial_freq_hz,
+                    "dial_freq_mhz": freq_mhz,
+                    "mode": state.mode,
+                    "de_call": state.de_call,
+                    "de_grid": state.de_grid,
+                    "dx_call": state.dx_call,
+                    "dx_grid": state.dx_grid,
+                    "tx_enabled": state.tx_enabled,
+                    "transmitting": state.transmitting,
+                    "decoding": state.decoding,
+                    "solar": solar_payload,
+                    "pattern": {
+                        "filename": pattern_file,
+                        "band": current_band,
+                        "nominal_mhz": nominal_mhz,
+                        "peak_gain": round(peak_gain, 2),
+                        "offset_deg": NORTH_OFFSET_DEG,
+                        "slice_15deg": pattern_slice
+                    },
+                    "cq_only": state.cq_only,
+                    "hide_worked": state.hide_worked,
+                    "worked_total": len(state.log_watcher.worked_any) if state.log_watcher else 0,
+                    "decodes": ranked_list,
+                    "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                }
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+            return
+
+        super().do_GET()
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+        
+        if self.path == "/api/reply":
+            try:
+                params = json.loads(body)
+                call = params.get("call")
+                msg = params.get("message")
+                snr = int(params.get("snr", -10))
+                qtime_ms = int(params.get("qtime_ms", 0))
+                df = int(params.get("df", 1500))
+                dt = float(params.get("dt", 0.2))
+                mode = params.get("mode", "~")
+                
+                with state.lock:
+                    target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
+                    client_id = state.wsjt_client_id or "WSJT-X"
+
+                pkt = build_wsjt_reply_packet(
+                    target_id=client_id,
+                    qtime_ms=qtime_ms,
+                    snr=snr,
+                    delta_time=dt,
+                    delta_freq=df,
+                    mode=mode,
+                    message=msg
+                )
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto(pkt, target_addr)
+                if target_addr != ("127.0.0.1", 2237):
+                    try:
+                        sock.sendto(pkt, ("127.0.0.1", 2237))
+                    except Exception:
+                        pass
+                sock.close()
+                print(f"[Reply] Sent Type 4 Reply for '{msg}' (ID: {client_id}) to {target_addr} and 127.0.0.1:2237")
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "call": call}).encode("utf-8"))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+        elif self.path == "/api/simulate":
+            # Injects benchmark dataset for instant testing (domestic US/Canada & international DX)
+            simulated = [
+                (2*3600*1000 + 13*60*1000, -12, 0.3, 1250, "~", "CQ K7DUR DM42"),
+                (2*3600*1000 + 13*60*1000, -18, 0.2, 1819, "~", "CQ KD9XX EN52"),
+                (2*3600*1000 + 13*60*1000, -15, 0.5, 2102, "~", "CQ VE7LWW DO00"),
+                (2*3600*1000 + 13*60*1000,  -4, 0.2, 2315, "~", "K6VVK W7AJP DM09"),
+                (2*3600*1000 + 13*60*1000, -17, 0.2, 2488, "~", "CQ WA6ZTY CM97"),
+                (2*3600*1000 + 13*60*1000 + 15000, -13, 0.2, 1735, "~", "CQ KF7FNC CN85"),
+                (2*3600*1000 + 13*60*1000 + 15000,  -7, 0.4, 2005, "~", "CQ KE6RAD CM97"),
+                (2*3600*1000 + 13*60*1000 + 15000,  -6, 0.2, 2218, "~", "CQ N7SBL CN85"),
+                (2*3600*1000 + 13*60*1000 + 15000, -14, 0.3, 1420, "~", "CQ JA1ABC PM95"),
+                (2*3600*1000 + 13*60*1000 + 15000, -16, 0.4, 1680, "~", "CQ DL1ABC JO31")
+            ]
+            for t, snr, dt, df, m, msg in simulated:
+                process_decode(t, snr, dt, df, m, msg)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "count": len(simulated)}).encode("utf-8"))
+            return
+
+        elif self.path == "/api/clear":
+            with state.lock:
+                state.decodes.clear()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        elif self.path == "/api/settings":
+            try:
+                params = json.loads(body)
+                with state.lock:
+                    if "cq_only" in params:
+                        state.cq_only = bool(params["cq_only"])
+                    if "hide_worked" in params:
+                        state.hide_worked = bool(params["hide_worked"])
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "success": True,
+                    "cq_only": state.cq_only,
+                    "hide_worked": state.hide_worked
+                }).encode("utf-8"))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+        self.send_response(404)
+        self.end_headers()
+
+# -----------------------------------------------------------------------------
+# Main Application Entrypoint
+# -----------------------------------------------------------------------------
+def main():
+    print("=" * 80)
+    print("WSJT-X QSO ANALYZER SERVICE")
+    print("=" * 80)
+    
+    # Initialize Multi-Band Antenna Pattern Manager
+    state.pattern_manager = AntennaPatternManager(PATTERNS_DIR, north_offset_deg=NORTH_OFFSET_DEG)
+    # Set initial active pattern for default frequency (e.g. 14.074 MHz / 20m)
+    state.pattern_manager.set_frequency(state.dial_freq_hz / 1e6)
+    
+    # Initialize WSJT-X Log Watcher (tracks B4 / worked-before stations)
+    state.log_watcher = WsjtxLogWatcher()
+    
+    # Initialize Country & State Location Resolver
+    state.loc_resolver = LocationResolver()
+    
+    # Fetch initial solar data
+    state.solar = SpaceWeather.fetch()
+    
+    # Start threads
+    t_udp = threading.Thread(target=udp_listener_thread, daemon=True)
+    t_udp.start()
+    
+    t_sw = threading.Thread(target=space_weather_poller, daemon=True)
+    t_sw.start()
+    
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), DashboardHandler)
+    print(f"[HTTP] Dashboard ready at http://localhost:{HTTP_PORT}/")
+    print("=" * 80)
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+        server.server_close()
+
+if __name__ == "__main__":
+    main()

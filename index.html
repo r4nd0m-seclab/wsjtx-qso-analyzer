@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WSJT-X QSO Analyzer</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 8v20M10 28l6-12 6 12M12 24h8' stroke='%2338bdf8' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='16' cy='8' r='2.5' fill='%2338bdf8'/%3E%3Cpath d='M11 5a7 7 0 0 0 0 6M21 5a7 7 0 0 1 0 6' stroke='%2334d399' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3Cpath d='M7 2a13 13 0 0 0 0 12M25 2a13 13 0 0 1 0 12' stroke='%2338bdf8' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --bg-card: #1e293b;
+      --bg-hover: #334155;
+      --border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --accent: #818cf8;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background-color: var(--bg-card);
+      border-bottom: 1px solid var(--border);
+      padding: 0.75rem 1.5rem;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .brand h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -0.02em; color: var(--text-main); }
+    .status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background-color: #64748b;
+      box-shadow: 0 0 8px rgba(100, 116, 139, 0.5);
+    }
+    .status-dot.online { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
+
+    .header-pills {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .pill {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.65rem;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .pill-label { color: var(--text-muted); font-weight: 500; }
+    .pill-val { font-weight: 600; color: var(--primary); }
+
+    main {
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      flex: 1;
+    }
+
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 1.25rem;
+    }
+    @media (max-width: 900px) {
+      .bottom-grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card-header {
+      padding: 0.85rem 1.15rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .card-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .btn-group { display: flex; gap: 0.5rem; }
+    .btn {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 0.35rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { background: var(--bg-hover); border-color: #64748b; }
+    .btn-primary { background: var(--primary); color: #0f172a; border-color: var(--primary); font-weight: 600; }
+    .btn-primary:hover { background: #7dd3fc; }
+    .btn-call {
+      background: rgba(16, 185, 129, 0.2);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      padding: 0.25rem 0.6rem;
+      font-weight: 600;
+      border-radius: 4px;
+    }
+    .btn-call:hover {
+      background: var(--success);
+      color: #0f172a;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+    th {
+      background: rgba(15, 23, 42, 0.6);
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 0.65rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.04em;
+    }
+    td {
+      padding: 0.65rem 0.85rem;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+      white-space: nowrap;
+    }
+    tr:hover td { background-color: rgba(255, 255, 255, 0.02); }
+
+    .callsign { font-weight: 700; color: #fff; font-size: 0.92rem; }
+    .grid { color: var(--primary); font-family: monospace; font-size: 0.88rem; }
+    
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .badge-excellent { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-good { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-marginal { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .badge-state {
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      font-weight: 700;
+      font-size: 0.76rem;
+      letter-spacing: 0.03em;
+    }
+    .badge-dx {
+      background: rgba(129, 140, 248, 0.15);
+      color: #818cf8;
+      border: 1px solid rgba(129, 140, 248, 0.3);
+      font-weight: 700;
+      font-size: 0.76rem;
+      letter-spacing: 0.03em;
+    }
+
+    .radar-container {
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1rem;
+    }
+    canvas#radar {
+      background: #090d16;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.8);
+    }
+
+    .space-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.65rem;
+      padding: 0.85rem;
+    }
+    .space-box {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.6rem;
+    }
+    .space-box .lbl { font-size: 0.72rem; color: var(--text-muted); }
+    .space-box .val { font-size: 1.05rem; font-weight: 700; color: #fff; margin-top: 0.15rem; }
+
+    footer {
+      padding: 0.65rem 1.5rem;
+      background: var(--bg-card);
+      border-top: 1px solid var(--border);
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div id="wsjt-dot" class="status-dot"></div>
+      <h1>WSJT-X QSO Analyzer</h1>
+    </div>
+
+    <div class="header-pills">
+      <div class="pill">
+        <span class="pill-label">WSJT-X:</span>
+        <span id="wsjt-status" class="pill-val">Listening (Port 2237)</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">Dial:</span>
+        <span id="dial-freq" class="pill-val">14.074 MHz FT8</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">Pattern:</span>
+        <span id="pattern-badge" class="pill-val" style="color: #38bdf8;">--</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">Log:</span>
+        <span id="log-count" class="pill-val" style="color: #c084fc;">--</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">QTH:</span>
+        <span id="station-qth" class="pill-val">W5KARS (EL09)</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">SFI:</span>
+        <span id="solar-sfi" class="pill-val">--</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">Kp:</span>
+        <span id="solar-kp" class="pill-val">--</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">Noise:</span>
+        <span id="solar-noise" class="pill-val">--</span>
+      </div>
+      <div class="pill">
+        <span class="pill-label">UTC:</span>
+        <span id="clock-utc" class="pill-val" style="color: #fff;">00:00:00</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left Column: Live Ranked Table -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Target Candidate Prioritization</span>
+          <span id="candidate-count" style="font-size: 0.78rem; font-weight: 500; color: var(--primary); margin-left: 0.35rem;">(Top 10 Ranked)</span>
+        </div>
+        <div class="btn-group" style="align-items: center;">
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: var(--text-main); margin-right: 0.5rem; user-select: none;">
+            <input type="checkbox" id="cq-only-toggle" checked onchange="toggleCqOnly(this.checked)" style="accent-color: var(--primary); width: 15px; height: 15px; cursor: pointer;">
+            <span><b>CQ Only</b></span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: #c084fc; margin-right: 0.65rem; user-select: none;">
+            <input type="checkbox" id="hide-worked-toggle" checked onchange="toggleHideWorked(this.checked)" style="accent-color: #a855f7; width: 15px; height: 15px; cursor: pointer;">
+            <span><b>Hide Worked (B4)</b></span>
+          </label>
+          <button class="btn btn-primary" onclick="injectSimulate()">Inject Test Decodes</button>
+          <button class="btn" onclick="clearDecodes()">Clear</button>
+        </div>
+      </div>
+
+      <div style="overflow-x: auto;">
+        <table id="decodes-table">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Action</th>
+              <th>Callsign</th>
+              <th>Grid</th>
+              <th>Country / State</th>
+              <th>Distance</th>
+              <th>Bearing</th>
+              <th>Takeoff (El)</th>
+              <th>Ant Gain</th>
+              <th>SNR</th>
+              <th>RX Margin</th>
+              <th>Score / Status</th>
+            </tr>
+          </thead>
+          <tbody id="decodes-tbody">
+            <tr>
+              <td colspan="12" style="text-align: center; color: var(--text-muted); padding: 3rem;">
+                Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...<br>
+                <span style="font-size: 0.8rem; margin-top: 0.5rem; display: inline-block;">
+                  (Click <b>"Inject Test Decodes"</b> above to view screenshot benchmark data)
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Bottom Row: Antenna Radar & Space Weather -->
+    <div class="bottom-grid">
+      
+      <!-- Antenna Directivity Radar -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Antenna Azimuth Radar</div>
+          <span style="font-size: 0.75rem; color: var(--text-muted);" id="radar-elevation-label">El: ~15°</span>
+        </div>
+        <div class="radar-container">
+          <canvas id="radar" width="300" height="300"></canvas>
+          <div style="font-size: 0.75rem; color: var(--text-muted); text-align: center;">
+            <span style="color: #38bdf8;">■</span> MMANA-GAL Envelope &nbsp;|&nbsp;
+            <span style="color: #34d399;">●</span> Decoded Target
+          </div>
+        </div>
+      </div>
+
+      <!-- Space Weather Summary -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Space Weather (solar.w5mmw.net)</div>
+          <span style="font-size: 0.75rem; color: var(--text-muted);" id="sw-last-updated">Updated: --</span>
+        </div>
+        <div class="space-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); padding: 1.25rem; gap: 1rem;">
+          <div class="space-box">
+            <div class="lbl">Solar Flux (SFI)</div>
+            <div class="val" id="sw-sfi">--</div>
+          </div>
+          <div class="space-box">
+            <div class="lbl">Sunspot Number</div>
+            <div class="val" id="sw-ssn">--</div>
+          </div>
+          <div class="space-box">
+            <div class="lbl">Geomagnetic (Kp)</div>
+            <div class="val" id="sw-kp">--</div>
+          </div>
+          <div class="space-box">
+            <div class="lbl">Solar Wind</div>
+            <div class="val" id="sw-wind">--</div>
+          </div>
+          <div class="space-box">
+            <div class="lbl">X-Ray Flux</div>
+            <div class="val" id="sw-xray">--</div>
+          </div>
+          <div class="space-box" id="sw-band-box" style="border: 1px solid rgba(56, 189, 248, 0.3); background: rgba(56, 189, 248, 0.04);">
+            <div class="lbl" id="sw-band-lbl">Band Condition</div>
+            <div class="val" id="sw-band-val" style="color: #34d399;">--</div>
+            <span id="sw-20m" style="display: none;">--</span>
+          </div>
+        </div>
+
+        <!-- HF Band Propagation by Band Group -->
+        <div style="border-top: 1px solid var(--border); padding: 1rem 1.25rem;">
+          <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center;">
+            <span>HF Propagation by Band Group</span>
+            <span style="font-size: 0.72rem; font-weight: 400; color: var(--text-muted);">Auto-tracks WSJT-X Active Band</span>
+          </div>
+          <div id="sw-bands-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem;">
+            <!-- Rendered by JS -->
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <footer>
+    <div>Model: Chameleon CHA EMCOMM II V2 @ 8-10ft AGL (Kendall County, TX)</div>
+    <div id="footer-update">Updated: --</div>
+  </footer>
+
+  <script>
+    let currentDecodes = [];
+    let antennaPatternSlice = [];
+    let cqOnlyFilter = true;
+    let hideWorkedFilter = true;
+
+    // Toggle CQ Only Filter
+    function toggleCqOnly(checked) {
+      cqOnlyFilter = checked;
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cq_only: checked })
+      }).catch(e => console.error(e));
+      renderTable(currentDecodes);
+      renderRadar(antennaPatternSlice, currentDecodes);
+    }
+
+    // Toggle Hide Worked (B4) Filter
+    function toggleHideWorked(checked) {
+      hideWorkedFilter = checked;
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hide_worked: checked })
+      }).catch(e => console.error(e));
+      renderTable(currentDecodes);
+      renderRadar(antennaPatternSlice, currentDecodes);
+    }
+
+    // UTC Clock
+    function updateClock() {
+      const now = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      document.getElementById('clock-utc').innerText =
+        `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())} UTC`;
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    // Solar Weather Helpers
+    function getBandNameFromFreq(f) {
+      if (!f) return "20m";
+      if (f >= 1.8 && f <= 2.0) return "160m";
+      if (f >= 3.5 && f <= 4.0) return "80m";
+      if (f >= 5.3 && f <= 5.5) return "60m";
+      if (f >= 7.0 && f <= 7.3) return "40m";
+      if (f >= 10.1 && f <= 10.15) return "30m";
+      if (f >= 14.0 && f <= 14.35) return "20m";
+      if (f >= 18.068 && f <= 18.168) return "17m";
+      if (f >= 21.0 && f <= 21.45) return "15m";
+      if (f >= 24.89 && f <= 24.99) return "12m";
+      if (f >= 28.0 && f <= 29.7) return "10m";
+      if (f >= 50.0 && f <= 54.0) return "6m";
+      return `${f.toFixed(3)}MHz`;
+    }
+
+    function getSolarGroup(f) {
+      if (!f) return "30m-20m";
+      if (f < 10.0) return "80m-40m";
+      if (f < 18.0) return "30m-20m";
+      if (f < 24.0) return "17m-15m";
+      return "12m-10m";
+    }
+
+    const BAND_GROUP_METADATA = [
+      { key: "80m-40m", range: "3.5 – 7.3 MHz" },
+      { key: "30m-20m", range: "10.1 – 14.35 MHz" },
+      { key: "17m-15m", range: "18.068 – 21.45 MHz" },
+      { key: "12m-10m", range: "24.89 – 29.7 MHz" }
+    ];
+
+    function getSolarBadge(status) {
+      const s = (status || '--').trim();
+      let cls = 'badge-marginal';
+      if (s === 'Good') cls = 'badge-excellent';
+      else if (s === 'Fair') cls = 'badge-good';
+      return `<span class="badge ${cls}" style="font-size: 0.7rem; padding: 0.15rem 0.4rem;">${s}</span>`;
+    }
+
+    function renderSolarBandsGrid(bandsMap, activeGroup, activeBand) {
+      const container = document.getElementById('sw-bands-grid');
+      if (!container) return;
+
+      let html = '';
+      BAND_GROUP_METADATA.forEach(bg => {
+        const cond = bandsMap[bg.key] || { day: '--', night: '--' };
+        const isActive = (bg.key === activeGroup);
+        const borderStyle = isActive
+          ? 'border: 1.5px solid var(--primary); background: rgba(56, 189, 248, 0.08); box-shadow: 0 0 12px rgba(56, 189, 248, 0.15);'
+          : 'border: 1px solid var(--border); background: #0f172a;';
+
+        const activeBadge = isActive
+          ? `<span style="background: var(--primary); color: #0f172a; font-size: 0.62rem; font-weight: 700; padding: 1px 5px; border-radius: 3px; letter-spacing: 0.03em;">ACTIVE (${activeBand})</span>`
+          : '';
+
+        html += `
+          <div style="${borderStyle} border-radius: 6px; padding: 0.65rem 0.75rem; transition: all 0.2s ease;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+              <span style="font-weight: 700; font-size: 0.85rem; color: ${isActive ? 'var(--primary)' : '#fff'};">${bg.key}</span>
+              ${activeBadge}
+            </div>
+            <div style="font-size: 0.68rem; color: var(--text-muted); margin-bottom: 0.5rem;">${bg.range}</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; margin-top: 0.25rem;">
+              <span style="color: var(--text-muted);">Day:</span>
+              ${getSolarBadge(cond.day)}
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; margin-top: 0.35rem;">
+              <span style="color: var(--text-muted);">Night:</span>
+              ${getSolarBadge(cond.night)}
+            </div>
+          </div>
+        `;
+      });
+
+      container.innerHTML = html;
+    }
+
+    // Fetch live state from backend
+    async function pollState() {
+      try {
+        const resp = await fetch('/api/state');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        
+        // WSJT-X Connection State
+        const dot = document.getElementById('wsjt-dot');
+        const stText = document.getElementById('wsjt-status');
+        if (data.connected) {
+          dot.className = "status-dot online";
+          stText.innerText = "Connected";
+          stText.style.color = "var(--success)";
+        } else {
+          dot.className = "status-dot";
+          stText.innerText = "Listening (2237)";
+          stText.style.color = "var(--text-muted)";
+        }
+
+        // Headers
+        document.getElementById('dial-freq').innerText = `${data.dial_freq_mhz} MHz ${data.mode}`;
+        document.getElementById('station-qth').innerText = `${data.de_call} (${data.de_grid})`;
+        const logEl = document.getElementById('log-count');
+        if (logEl) {
+          logEl.innerText = `${data.worked_total || 0} wkd`;
+        }
+
+        // Solar Weather
+        const sol = data.solar || {};
+        document.getElementById('solar-sfi').innerText = sol.solar_flux || '--';
+        document.getElementById('solar-kp').innerText = sol.kp_index !== undefined ? `${sol.kp_index}` : '--';
+        document.getElementById('solar-noise').innerText = sol.noise_floor || '--';
+
+        document.getElementById('sw-sfi').innerText = sol.solar_flux ? `${sol.solar_flux} SFI` : '--';
+        document.getElementById('sw-ssn').innerText = sol.sunspot_number || '--';
+        document.getElementById('sw-kp').innerText = sol.kp_index !== undefined ? `${sol.kp_index} (${sol.geomagnetic_storm || 'Quiet'})` : '--';
+        document.getElementById('sw-wind').innerText = sol.solar_wind_km_s ? `${sol.solar_wind_km_s} km/s` : '--';
+        document.getElementById('sw-xray').innerText = sol.x_ray || '--';
+
+        const swUpdatedEl = document.getElementById('sw-last-updated');
+        if (swUpdatedEl && sol.updated_utc) {
+          swUpdatedEl.innerText = `Observed: ${sol.updated_utc}`;
+        }
+
+        // Determine Active Band & Solar Group
+        const activeBand = (data.pattern && data.pattern.band) ? data.pattern.band : getBandNameFromFreq(data.dial_freq_mhz);
+        const activeGroup = sol.active_group || getSolarGroup(data.dial_freq_mhz);
+        const bandsMap = sol.bands || {};
+        const activeCond = (sol.active_condition && sol.active_condition.day !== '--') ? sol.active_condition : (bandsMap[activeGroup] || { day: '--', night: '--' });
+
+        const bandLblEl = document.getElementById('sw-band-lbl');
+        if (bandLblEl) {
+          bandLblEl.innerText = `${activeBand} Condition (${activeGroup})`;
+        }
+
+        const bandValEl = document.getElementById('sw-band-val');
+        if (bandValEl) {
+          bandValEl.innerText = `D:${activeCond.day} / N:${activeCond.night}`;
+          if (activeCond.day === 'Poor' || activeCond.night === 'Poor') {
+            bandValEl.style.color = '#f87171';
+          } else if (activeCond.day === 'Fair' || activeCond.night === 'Fair') {
+            bandValEl.style.color = '#fbbf24';
+          } else {
+            bandValEl.style.color = '#34d399';
+          }
+        }
+
+        const legacy20m = document.getElementById('sw-20m');
+        if (legacy20m) {
+          legacy20m.innerText = `D:${activeCond.day} / N:${activeCond.night}`;
+        }
+
+        renderSolarBandsGrid(bandsMap, activeGroup, activeBand);
+
+        // Antenna Pattern
+        if (data.pattern) {
+          const pat = data.pattern;
+          const badgeEl = document.getElementById('pattern-badge');
+          if (badgeEl) {
+            badgeEl.innerText = pat.filename ? `${pat.filename} (${pat.band || ''})` : '--';
+          }
+
+          const radarLbl = document.getElementById('radar-elevation-label');
+          if (radarLbl) {
+            const peakStr = (pat.peak_gain !== undefined && pat.peak_gain >= 0) ? `+${pat.peak_gain}` : `${pat.peak_gain}`;
+            radarLbl.innerText = `${pat.filename} (${pat.band}) | Peak: ${peakStr} dBi | El: ~15°`;
+          }
+
+          if (pat.slice_15deg) {
+            antennaPatternSlice = pat.slice_15deg;
+          }
+        }
+
+        // Decodes Table
+        currentDecodes = data.decodes || [];
+        renderTable(currentDecodes);
+        renderRadar(antennaPatternSlice, currentDecodes);
+
+        document.getElementById('footer-update').innerText = `Server Time: ${data.server_time_utc}`;
+      } catch (e) {
+        console.error("State poll error:", e);
+      }
+    }
+
+    function renderTable(decodes) {
+      const tbody = document.getElementById('decodes-tbody');
+      let filtered = decodes || [];
+      if (cqOnlyFilter) filtered = filtered.filter(d => d.is_cq);
+      if (hideWorkedFilter) filtered = filtered.filter(d => !d.worked_band);
+      const top10 = filtered.slice(0, 10);
+
+      const countEl = document.getElementById('candidate-count');
+      if (countEl) {
+        countEl.innerText = filtered.length > 10
+          ? `(Top 10 of ${filtered.length} Candidates)`
+          : `(${top10.length} Candidate${top10.length === 1 ? '' : 's'})`;
+      }
+
+      if (!top10 || top10.length === 0) {
+        const msg = (decodes && decodes.length > 0)
+          ? `No matching candidates (${decodes.length} decodes filtered by CQ Only or Hide Worked). Adjust filters above.`
+          : `Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...<br>
+             <span style="font-size: 0.8rem; margin-top: 0.5rem; display: inline-block;">
+               (Click <b>"Inject Test Decodes"</b> above to view benchmark data)
+             </span>`;
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="12" style="text-align: center; color: var(--text-muted); padding: 3rem;">
+              ${msg}
+            </td>
+          </tr>`;
+        return;
+      }
+
+      let html = '';
+      top10.forEach((d, idx) => {
+        let badgeClass = 'badge-marginal';
+        if (d.rec === 'EXCELLENT') badgeClass = 'badge-excellent';
+        else if (d.rec === 'GOOD') badgeClass = 'badge-good';
+        else if (d.rec === 'WORKED B4') badgeClass = 'badge-marginal';
+
+        const gainSign = d.gain >= 0 ? '+' : '';
+        const snrSign = d.snr >= 0 ? '+' : '';
+        const margSign = d.rx_margin >= 0 ? '+' : '';
+
+        const typeBadge = d.is_cq
+          ? `<span style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;">CQ</span>`
+          : `<span style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; margin-left: 0.35rem;">QSO</span>`;
+
+        let b4Badge = '';
+        if (d.worked_band) {
+          const q = d.last_qso || {};
+          b4Badge = `<span style="background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="Worked before on ${q.date || ''} ${q.time || ''} (${q.band || ''})">B4 (${q.band || 'BAND'})</span>`;
+        } else if (d.worked_any) {
+          const q = d.last_qso || {};
+          b4Badge = `<span style="background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.3); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; margin-left: 0.35rem;" title="Worked before on ${q.band || ''} (${q.date || ''})">NEW BAND (WKD ${q.band || ''})</span>`;
+        }
+
+        html += `
+          <tr>
+            <td style="color: var(--text-muted); font-weight: 700;">#${idx + 1}</td>
+            <td>
+              <button class="btn-call" onclick="sendReply('${d.call}', '${escapeMsg(d.message)}', ${d.snr}, ${d.qtime_ms}, ${d.df}, ${d.dt}, '${d.mode}')">
+                CALL
+              </button>
+            </td>
+            <td><span class="callsign">${d.call}</span>${typeBadge}${b4Badge}</td>
+            <td><span class="grid">${d.grid}</span></td>
+            <td>
+              <span class="badge ${d.is_dx ? 'badge-dx' : 'badge-state'}" title="${d.loc_full || d.country || ''}">
+                ${d.loc_code || '--'}
+              </span>
+              <span style="font-size: 0.72rem; color: var(--text-muted); margin-left: 0.3rem;">
+                ${d.loc_sub || ''}
+              </span>
+            </td>
+            <td>${(d.dist_mi || Math.round(d.dist_km * 0.621371)).toLocaleString()} mi</td>
+            <td>${d.az}°</td>
+            <td>${d.el}° (${d.path_state})</td>
+            <td style="font-weight: 600; color: ${d.gain >= -3 ? '#38bdf8' : '#f87171'}">${gainSign}${d.gain} dBi</td>
+            <td>${snrSign}${d.snr} dB</td>
+            <td>${margSign}${d.rx_margin} dB</td>
+            <td>
+              <span class="badge ${badgeClass}">${d.score} (${d.rec})</span>
+            </td>
+          </tr>
+        `;
+      });
+      tbody.innerHTML = html;
+    }
+
+    function escapeMsg(m) {
+      return (m || '').replace(/'/g, "\\'");
+    }
+
+    function showToast(text, isError = false) {
+      let toast = document.getElementById('toast-msg');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toast-msg';
+        toast.style.position = 'fixed';
+        toast.style.bottom = '24px';
+        toast.style.right = '24px';
+        toast.style.padding = '0.85rem 1.25rem';
+        toast.style.borderRadius = '8px';
+        toast.style.fontSize = '0.88rem';
+        toast.style.fontWeight = '600';
+        toast.style.boxShadow = '0 8px 24px rgba(0,0,0,0.5)';
+        toast.style.zIndex = '9999';
+        toast.style.transition = 'all 0.25s ease';
+        document.body.appendChild(toast);
+      }
+      toast.style.background = isError ? '#ef4444' : '#10b981';
+      toast.style.color = '#fff';
+      toast.innerText = text;
+      toast.style.display = 'block';
+      toast.style.opacity = '1';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => { toast.style.display = 'none'; }, 300);
+      }, 3500);
+    }
+
+    async function sendReply(call, msg, snr, qtime_ms, df, dt, mode) {
+      try {
+        const resp = await fetch('/api/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ call, message: msg, snr, qtime_ms, df, dt, mode })
+        });
+        const res = await resp.json();
+        if (res.success) {
+          showToast(`✓ Sent Reply to WSJT-X for ${call} (Requires 'Accept UDP requests' enabled in WSJT-X Settings)`);
+        } else {
+          showToast(`Error: ${res.error}`, true);
+        }
+      } catch (e) {
+        showToast(`Network error: ${e}`, true);
+      }
+    }
+
+    async function injectSimulate() {
+      await fetch('/api/simulate', { method: 'POST' });
+      pollState();
+    }
+
+    async function clearDecodes() {
+      await fetch('/api/clear', { method: 'POST' });
+      pollState();
+    }
+
+    // Render 2D Polar Radar Plot on Canvas
+    function renderRadar(patternSlice, decodes) {
+      const canvas = document.getElementById('radar');
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      const cx = w / 2;
+      const cy = h / 2;
+      const r = (w / 2) - 25;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // Radar circles (0 dB, -10 dB, -20 dB, -30 dB)
+      const circles = [
+        { label: '+5dB', ratio: 1.0 },
+        { label: ' 0dB', ratio: 0.8 },
+        { label: '-10dB', ratio: 0.55 },
+        { label: '-20dB', ratio: 0.3 }
+      ];
+
+      ctx.strokeStyle = 'rgba(51, 65, 85, 0.6)';
+      ctx.lineWidth = 1;
+      circles.forEach(c => {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * c.ratio, 0, 2 * Math.PI);
+        ctx.stroke();
+      });
+
+      // Compass crosshairs
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
+      ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy);
+      ctx.stroke();
+
+      // Cardinal direction labels
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('N 0°', cx, cy - r - 12);
+      ctx.fillText('S 180°', cx, cy + r + 12);
+      ctx.fillText('E 90°', cx + r + 16, cy);
+      ctx.fillText('W 270°', cx - r - 16, cy);
+
+      // Draw Antenna Pattern Envelope
+      if (patternSlice && patternSlice.length >= 360) {
+        ctx.beginPath();
+        const minGain = -30.0;
+        const maxGain = 5.0; // scale up to +5 dBi
+
+        for (let az = 0; az < 360; az++) {
+          const g = patternSlice[az];
+          const norm = Math.max(0.0, Math.min(1.0, (g - minGain) / (maxGain - minGain)));
+          const dist = r * norm;
+          const theta = (az - 90) * (Math.PI / 180.0); // 0° North is up
+          const x = cx + dist * Math.cos(theta);
+          const y = cy + dist * Math.sin(theta);
+
+          if (az === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+        ctx.fill();
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      // Plot Decoded Targets as Points
+      let targets = decodes || [];
+      if (cqOnlyFilter) targets = targets.filter(d => d.is_cq);
+      if (hideWorkedFilter) targets = targets.filter(d => !d.worked_band);
+      const top10Targets = targets.slice(0, 10);
+      top10Targets.forEach(d => {
+        const theta = (d.az - 90) * (Math.PI / 180.0);
+        // Place targets near perimeter or scaled by distance
+        const targetR = r * 0.85;
+        const tx = cx + targetR * Math.cos(theta);
+        const ty = cy + targetR * Math.sin(theta);
+
+        ctx.beginPath();
+        ctx.arc(tx, ty, 4.5, 0, 2 * Math.PI);
+        if (d.rec === 'EXCELLENT') ctx.fillStyle = '#34d399';
+        else if (d.rec === 'GOOD') ctx.fillStyle = '#fbbf24';
+        else ctx.fillStyle = '#f87171';
+        ctx.fill();
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Label callsign
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.fillText(d.call, tx, ty - 8);
+      });
+    }
+
+    // Start polling every 1.5 seconds
+    setInterval(pollState, 1500);
+    pollState();
+  </script>
+</body>
+</html>
