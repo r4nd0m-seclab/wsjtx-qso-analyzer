@@ -774,8 +774,19 @@
         const snrSign = d.snr >= 0 ? '+' : '';
         const margSign = d.rx_margin >= 0 ? '+' : '';
 
+        let cqLabel = 'CQ';
+        let cqColor = '#38bdf8';
+        let cqBg = 'rgba(56, 189, 248, 0.2)';
+        let cqBorder = 'none';
+        if (d.cq_target) {
+          cqLabel = `CQ ${d.cq_target}`;
+          cqColor = '#fbbf24';
+          cqBg = 'rgba(245, 158, 11, 0.2)';
+          cqBorder = '1px solid rgba(245, 158, 11, 0.4)';
+        }
+
         const typeBadge = d.is_cq
-          ? `<span style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;">CQ</span>`
+          ? `<span style="background: ${cqBg}; color: ${cqColor}; border: ${cqBorder}; padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="${d.cq_target ? 'Directed CQ (' + d.cq_target + ') matching our station' : 'Standard CQ'}">${cqLabel}</span>`
           : `<span style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; margin-left: 0.35rem;">QSO</span>`;
 
         let workedBadge = '';

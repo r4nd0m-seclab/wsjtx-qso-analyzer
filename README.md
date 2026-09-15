@@ -36,6 +36,7 @@ A containerized, real-time ham radio station companion that listens to **WSJT-X 
 6. **Interactive 1-Click Call:** Clicking **"CALL"** sends a Type 4 `Reply` UDP packet to WSJT-X, populating the DX Call and scheduling transmission on the next slot.
 7. **Antenna Directivity Radar:** HTML5 Canvas polar radar plot displaying the antenna's radiation envelope alongside plotted decoded station bearings.
 8. **TX Passband Optimization:** Monitors rolling 60-second passband activity to detect sub-frequency collisions and direct WSJT-X to the clearest open transmission slot.
+9. **Directed CQ Compliance Filtering:** Automatically parses targeted CQ modifiers (`CQ DX`, US states `CQ TX`, continents `CQ NA`/`CQ EU`, countries/prefixes `CQ JA`/`CQ VK`). Non-matching calls are restricted and suppressed from the candidate table so operators only see QSOs they are eligible to answer.
 
 ---
 

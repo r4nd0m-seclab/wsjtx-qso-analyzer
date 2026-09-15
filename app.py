@@ -443,11 +443,16 @@ class LocationResolver:
             loc_full = country_name
             is_dx = (country_code != 'US')
 
+        continent = ent.get('continent', '') if ent else ''
+        if not continent and country_code in ('US', 'CA', 'MX'):
+            continent = 'NA'
+
         return {
             'country': country_name,
             'country_code': country_code,
             'state': state_name,
             'state_code': state_code,
+            'continent': continent,
             'loc_code': loc_code,
             'loc_sub': loc_sub,
             'loc_full': loc_full,
@@ -575,24 +580,194 @@ def ft8_decode_probability(snr_db: float, snr_threshold: float = -21.0, slope: f
     margin = snr_db - snr_threshold
     return 1.0 / (1.0 + math.exp(-slope * margin))
 
-def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], bool]:
-    """Extracts callsign, 4-char grid square, and is_cq flag from FT8 messages."""
+# -----------------------------------------------------------------------------
+# Directed CQ Target Constants & Matching
+# -----------------------------------------------------------------------------
+CONTINENT_CODES = {"NA", "SA", "EU", "AS", "AF", "OC", "AN"}
+
+US_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC"
+}
+
+CA_PROVINCES = {
+    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE",
+    "QC", "SK", "YT"
+}
+
+OPEN_CQ_MODIFIERS = {
+    "TEST", "FD", "FIELD", "POTA", "SOTA", "IOTA", "BOTA", "WW",
+    "QRP", "LP", "SP", "UP", "DOWN", "QSX", "VHF", "UHF", "EME",
+    "SAT", "ROVER", "PORT", "MOBILE", "MM", "AM", "CONTEST",
+    "RTTY", "FT8", "FT4", "SKCC", "NAQP", "CWT", "WPX", "ARRL",
+    "CQWW", "WWDX", "DXP", "EXP", "SPEC", "R", "RR73", "73"
+}
+
+US_CALL_DISTRICTS = {
+    "1": {"CT", "ME", "MA", "NH", "RI", "VT"},
+    "2": {"NJ", "NY"},
+    "3": {"DE", "MD", "PA", "DC"},
+    "4": {"AL", "FL", "GA", "KY", "NC", "SC", "TN", "VA"},
+    "5": {"AR", "LA", "MS", "NM", "OK", "TX"},
+    "6": {"CA"},
+    "7": {"AZ", "ID", "MT", "NV", "OR", "UT", "WA", "WY", "AK"},
+    "8": {"MI", "OH", "WV"},
+    "9": {"IL", "IN", "WI"},
+    "0": {"CO", "IA", "KS", "MN", "MO", "NE", "ND", "SD"}
+}
+
+def is_directed_cq_eligible(
+    target: Optional[str],
+    caller_call: str,
+    caller_grid: str,
+    my_call: str,
+    my_grid: str,
+    loc_resolver: Optional[LocationResolver]
+) -> Tuple[bool, str]:
+    """
+    Checks if our station matches a CQ modifier / directive.
+    Returns (is_eligible, reason_category).
+    If False, our station should not answer or see this CQ candidate.
+    """
+    if not target:
+        return True, "OPEN"
+
+    t = target.strip().upper()
+    if not t or t in OPEN_CQ_MODIFIERS:
+        return True, "OPEN"
+
+    # Split audio frequency or slot offset e.g. "CQ 2400", "CQ 999"
+    if t.isdigit() and len(t) >= 2:
+        return True, "SPLIT"
+
+    if not loc_resolver:
+        return True, "OPEN"
+
+    my_loc = loc_resolver.resolve(my_call, my_grid) if my_call else {}
+    my_country_code = (my_loc.get("country_code") or "").upper()
+    my_state_code = (my_loc.get("state_code") or "").upper()
+    my_continent = (my_loc.get("continent") or "").upper()
+    if not my_continent and my_country_code in ("US", "CA", "MX"):
+        my_continent = "NA"
+
+    caller_loc = loc_resolver.resolve(caller_call, caller_grid) if caller_call else {}
+    caller_country_code = (caller_loc.get("country_code") or "").upper()
+    caller_state_code = (caller_loc.get("state_code") or "").upper()
+    caller_continent = (caller_loc.get("continent") or "").upper()
+    if not caller_continent and caller_country_code in ("US", "CA", "MX"):
+        caller_continent = "NA"
+
+    # 1. CQ DX
+    if t == "DX":
+        # Cannot be same country
+        if caller_country_code and my_country_code and caller_country_code == my_country_code:
+            return False, "SAME_COUNTRY"
+        # In North America, US and Canada stations calling CQ DX exclude W/VE
+        if caller_country_code in ("US", "CA") and my_country_code in ("US", "CA"):
+            return False, "DOMESTIC_NA"
+        # Cannot be same continent
+        if caller_continent and my_continent and caller_continent == my_continent:
+            return False, "SAME_CONTINENT"
+        return True, "DX"
+
+    # 2. Continent directed: CQ NA, CQ EU, CQ AS, CQ OC, CQ AF, CQ SA, CQ AN
+    if t in CONTINENT_CODES:
+        if my_continent == t:
+            return True, f"CONTINENT_{t}"
+        return False, f"CONTINENT_{t}_MISMATCH"
+
+    # 3. US State / Canadian Province directed
+    if t == "CA":
+        if my_state_code == "CA" or my_country_code == "CA":
+            return True, "STATE_CA"
+        return False, "STATE_CA_MISMATCH"
+
+    if t in US_STATES:
+        if my_state_code == t:
+            return True, f"STATE_{t}"
+        return False, f"STATE_{t}_MISMATCH"
+
+    if t in CA_PROVINCES:
+        if my_state_code == t:
+            return True, f"PROV_{t}"
+        return False, f"PROV_{t}_MISMATCH"
+
+    # 4. US Call District directed: CQ 0 through CQ 9
+    if t in US_CALL_DISTRICTS:
+        m = re.search(r'\d', my_call) if my_call else None
+        call_digit = m.group(0) if m else ""
+        state_match = my_state_code in US_CALL_DISTRICTS[t]
+        if call_digit == t or state_match:
+            return True, f"DISTRICT_{t}"
+        return False, f"DISTRICT_{t}_MISMATCH"
+
+    # 5. Maidenhead Grid square (e.g. "CQ EL09") or field ("CQ EL")
+    if len(t) == 4 and re.match(r'^[A-R]{2}[0-9]{2}$', t):
+        if my_grid and my_grid.upper().startswith(t):
+            return True, f"GRID_{t}"
+        return False, f"GRID_{t}_MISMATCH"
+    if len(t) == 2 and re.match(r'^[A-R]{2}$', t) and my_grid and my_grid.upper().startswith(t):
+        return True, f"GRID_{t}"
+
+    # 6. Country / DXCC Entity directed
+    country_aliases = {
+        "USA": "US", "US": "US", "K": "US", "W": "US",
+        "CAN": "CA", "VE": "CA",
+        "MEX": "MX", "XE": "MX",
+        "UK": "GB", "GB": "GB", "G": "GB",
+        "JA": "JP", "JP": "JP",
+        "VK": "AU", "AU": "AU",
+        "ZL": "NZ", "NZ": "NZ",
+        "DL": "DE", "DE": "DE",
+        "F": "FR", "FR": "FR",
+        "I": "IT", "IT": "IT",
+        "EA": "ES", "ES": "ES"
+    }
+    target_iso = country_aliases.get(t)
+    if not target_iso and loc_resolver:
+        ent = loc_resolver.prefix_map.get(t) or loc_resolver.exact_map.get(t)
+        if ent:
+            target_iso = ent.get("iso", "")
+
+    if target_iso:
+        if my_country_code == target_iso:
+            return True, f"COUNTRY_{target_iso}"
+        return False, f"COUNTRY_{target_iso}_MISMATCH"
+
+    # Unrecognized modifier: treat as open contest/special event (e.g. CQ SKCC)
+    return True, "UNKNOWN_OPEN"
+
+def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], bool, Optional[str]]:
+    """Extracts callsign, 4-char grid square, is_cq flag, and directed cq_target from FT8 messages."""
     msg = message.strip()
     tokens = msg.split()
-    # CQ forms: "CQ K7DUR DM42", "CQ DX KD9XX EN52", "CQ NA ...", "QRZ K7DUR DM42"
+    # CQ forms:
+    # "CQ K7DUR DM42" -> len=3, tokens[0]="CQ", call=tokens[1], grid=tokens[2], target=None
+    # "CQ DX KD9XX EN52" -> len>=4, tokens[0]="CQ", target=tokens[1], call=tokens[2], grid=tokens[3]
+    # "CQ TX K7DUR DM42" -> len>=4, tokens[0]="CQ", target=tokens[1], call=tokens[2], grid=tokens[3]
+    # "QRZ K7DUR DM42" -> len=3, tokens[0]="QRZ", call=tokens[1], grid=tokens[2], target=None
+    # Non-CQ: "K6VVK W7AJP DM09" -> len=3, target=None, is_cq=False
     if len(tokens) >= 3 and tokens[0] in ("CQ", "QRZ"):
-        if len(tokens) == 3:
-            call, grid = tokens[1], tokens[2]
-        else: # e.g. CQ DX KD9XX EN52 or CQ NA ...
-            call, grid = tokens[2], tokens[3]
-        if re.match(r'^[A-R]{2}[0-9]{2}$', grid.upper()) and grid.upper() != "RR73":
-            return call, grid.upper(), True
+        if len(tokens) >= 4 and re.match(r'^[A-R]{2}[0-9]{2}$', tokens[3].upper()) and tokens[3].upper() != "RR73":
+            target = tokens[1].upper() if tokens[0] == "CQ" else None
+            call = tokens[2]
+            grid = tokens[3].upper()
+            return call, grid, True, target
+        elif re.match(r'^[A-R]{2}[0-9]{2}$', tokens[2].upper()) and tokens[2].upper() != "RR73":
+            call = tokens[1]
+            grid = tokens[2].upper()
+            return call, grid, True, None
     elif len(tokens) >= 3:
         # Station-to-station exchange: e.g. K6VVK W7AJP DM09
-        call, grid = tokens[1], tokens[2]
-        if re.match(r'^[A-R]{2}[0-9]{2}$', grid.upper()) and grid.upper() != "RR73":
-            return call, grid.upper(), False
-    return None, None, False
+        call = tokens[1]
+        grid = tokens[2].upper()
+        if re.match(r'^[A-R]{2}[0-9]{2}$', grid) and grid != "RR73":
+            return call, grid, False, None
+    return None, None, False, None
 
 # -----------------------------------------------------------------------------
 # Application State
@@ -723,8 +898,8 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
             current_tx_clear = False
             break
 
-    # Candidate 50Hz slots across the operational FT8 passband (400 - 2400 Hz)
-    candidates = list(range(min_hz, max_hz + 1, step_hz))
+    # Candidate 50Hz slots across the operational FT8 passband, descending to favor higher frequencies
+    candidates = list(range(max_hz, min_hz - 1, -step_hz))
     scored = []
 
     for f in candidates:
@@ -733,15 +908,15 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
         else:
             min_dist = 500.0
 
-        is_clean = (min_dist >= 35)
+        is_clean = (min_dist >= 40)
         scored.append({
             "df": f,
             "min_dist": min_dist,
             "is_clean": is_clean
         })
 
-    # Sort candidates: clean slots first, then highest distance to nearest active station
-    scored.sort(key=lambda s: (s["is_clean"], s["min_dist"]), reverse=True)
+    # Sort candidates: clean slots first, then adequate clearance (>=60 Hz), favoring higher frequencies first
+    scored.sort(key=lambda s: (s["is_clean"], min(s["min_dist"], 60.0), s["df"]), reverse=True)
 
     best = scored[0]
     optimal_df = best["df"]
@@ -776,17 +951,29 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
         if len(state.passband_decodes) > 300:
             state.passband_decodes = state.passband_decodes[-300:]
 
-    call, grid, is_cq = extract_call_and_grid(message)
+    call, grid, is_cq, cq_target = extract_call_and_grid(message)
     if not call or not grid:
         return
 
     with state.lock:
         home_grid = state.de_grid or DEFAULT_HOME_GRID
+        my_call = state.de_call or "W5KARS"
         pattern = state.pattern_manager.active_pattern if state.pattern_manager else None
         current_band = state.pattern_manager.active_band_name if state.pattern_manager else "20m"
         kp = state.solar.get("kp_index", 2.0)
         log_watcher = state.log_watcher
         loc_resolver = state.loc_resolver
+
+    # Check directed CQ restriction (e.g. CQ DX, CQ State, CQ Country, CQ Continent)
+    # If our station does not match the directive, returning the call is restricted and it must not appear in the list
+    if is_cq and cq_target:
+        eligible, match_reason = is_directed_cq_eligible(
+            cq_target, call, grid, my_call, home_grid, loc_resolver
+        )
+        if not eligible:
+            with state.lock:
+                state.decodes.pop(call, None)
+            return
         
     home_lat, home_lon = maidenhead_to_latlon(home_grid)
     rem_lat, rem_lon = maidenhead_to_latlon(grid)
@@ -859,6 +1046,7 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
         "score": round(score, 1),
         "rec": rec,
         "is_cq": is_cq,
+        "cq_target": cq_target,
         "worked_band": worked_band,
         "worked_any": worked_any,
         "other_bands": other_bands,
@@ -1009,7 +1197,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 pruned = {k: v for k, v in state.decodes.items() if now - v["timestamp"] < 360}
                 state.decodes = pruned
                 
-                ranked_list = list(state.decodes.values())
+                # Filter candidate list against directed CQ restrictions with current station profile
+                ranked_list = []
+                for d in state.decodes.values():
+                    if d.get("is_cq") and d.get("cq_target"):
+                        eligible, _ = is_directed_cq_eligible(
+                            d["cq_target"], d["call"], d["grid"],
+                            state.de_call, state.de_grid, state.loc_resolver
+                        )
+                        if not eligible:
+                            continue
+                    ranked_list.append(d)
                 ranked_list.sort(key=lambda x: x["score"], reverse=True)
                 
                 active_pat = state.pattern_manager.active_pattern if state.pattern_manager else None
@@ -1082,6 +1280,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 df = int(params.get("df", 1500))
                 dt = float(params.get("dt", 0.2))
                 mode = params.get("mode", "~")
+
+                # Verify if this message is a restricted directed CQ
+                if msg:
+                    c, g, is_cq, cq_target = extract_call_and_grid(msg)
+                    if is_cq and cq_target:
+                        ok, reason = is_directed_cq_eligible(
+                            cq_target, call or c or "", g or "",
+                            state.de_call, state.de_grid, state.loc_resolver
+                        )
+                        if not ok:
+                            self.send_response(400)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                "error": f"Returning call restricted: directed to '{cq_target}' ({reason})"
+                            }).encode("utf-8"))
+                            return
                 
                 with state.lock:
                     target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
