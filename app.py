@@ -32,6 +32,7 @@ NORTH_OFFSET_DEG = float(os.environ.get("NORTH_OFFSET_DEG", "0.0"))
 PATTERNS_DIR = os.environ.get("PATTERNS_DIR", "patterns")
 DEFAULT_CQ_ONLY = os.environ.get("CQ_ONLY", "true").lower() in ("true", "1", "yes")
 DEFAULT_HIDE_WORKED = os.environ.get("HIDE_WORKED", "true").lower() in ("true", "1", "yes")
+DEFAULT_TX_FREQ_OPTIMIZE = os.environ.get("TX_FREQ_OPTIMIZE", "false").lower() in ("true", "1", "yes")
 WSJTX_DATA_DIR = os.environ.get("WSJTX_DATA_DIR", "/wsjtx-data")
 
 # -----------------------------------------------------------------------------
@@ -598,7 +599,7 @@ def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], b
 # -----------------------------------------------------------------------------
 class State:
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.wsjt_connected = False
         self.last_heartbeat_time = 0.0
         self.dial_freq_hz = 14074000
@@ -610,6 +611,12 @@ class State:
         self.transmitting = False
         self.decoding = False
         self.tx_enabled = False
+        self.rx_df = 1500
+        self.tx_df = 1500
+        self.tx_freq_optimize = DEFAULT_TX_FREQ_OPTIMIZE
+        self.last_optimized_rx_df = 0
+        self.last_tx_optimize_send_time = 0.0
+        self.passband_decodes: List[Dict[str, Any]] = []
         self.cq_only = DEFAULT_CQ_ONLY
         self.hide_worked = DEFAULT_HIDE_WORKED
         self.wsjt_client_id = "WSJT-X"
@@ -660,7 +667,115 @@ def build_wsjt_reply_packet(target_id: str, qtime_ms: int, snr: int, delta_time:
     pkt += struct.pack("?B", low_conf, modifiers)
     return pkt
 
+def build_wsjt_configure_packet(target_id: str, rx_df: int) -> bytes:
+    magic = 0xadbccbda
+    schema = 3
+    msg_type = 15 # Configure
+    pkt = struct.pack(">III", magic, schema, msg_type)
+    pkt += encode_utf8(target_id)
+    pkt += encode_utf8("") # mode: no change
+    pkt += struct.pack(">I", 0xffffffff) # freq tol: no change
+    pkt += encode_utf8("") # submode: no change
+    pkt += struct.pack("?", False) # fast mode
+    pkt += struct.pack(">I", 0xffffffff) # T/R period: no change
+    pkt += struct.pack(">I", int(rx_df)) # rx_df
+    pkt += encode_utf8("") # dx call: no change
+    pkt += encode_utf8("") # dx grid: no change
+    pkt += struct.pack("?", False) # generate-messages
+    return pkt
+
+def send_wsjt_configure_rx_df(rx_df: int) -> bool:
+    with state.lock:
+        target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
+        client_id = state.wsjt_client_id or "WSJT-X"
+    pkt = build_wsjt_configure_packet(client_id, rx_df)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(pkt, target_addr)
+        if target_addr != ("127.0.0.1", 2237):
+            try:
+                sock.sendto(pkt, ("127.0.0.1", 2237))
+            except Exception:
+                pass
+        sock.close()
+        print(f"[Configure] Sent Configure Rx DF={rx_df}Hz (ID: {client_id}) to {target_addr}")
+        return True
+    except Exception as e:
+        print(f"[Configure] Error sending Configure: {e}")
+        return False
+
+def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, step_hz: int = 50) -> Dict[str, Any]:
+    now = time.time()
+    with state.lock:
+        state.passband_decodes = [d for d in state.passband_decodes if (now - d["timestamp"]) <= 60.0]
+        recent = list(state.passband_decodes)
+        tx_optimize_enabled = state.tx_freq_optimize
+        last_opt = state.last_optimized_rx_df
+        last_send = getattr(state, "last_tx_optimize_send_time", 0.0)
+        target_addr = state.wsjt_remote_addr
+
+    effective_tx = current_tx_df if current_tx_df > 0 else 1500
+
+    # Check if current_tx has any decode within 35 Hz in the last 60s
+    current_tx_clear = True
+    for d in recent:
+        if abs(d["df"] - effective_tx) < 35:
+            current_tx_clear = False
+            break
+
+    # Candidate 50Hz slots across the operational FT8 passband (400 - 2400 Hz)
+    candidates = list(range(min_hz, max_hz + 1, step_hz))
+    scored = []
+
+    for f in candidates:
+        if recent:
+            min_dist = min(abs(d["df"] - f) for d in recent)
+        else:
+            min_dist = 500.0
+
+        is_clean = (min_dist >= 35)
+        scored.append({
+            "df": f,
+            "min_dist": min_dist,
+            "is_clean": is_clean
+        })
+
+    # Sort candidates: clean slots first, then highest distance to nearest active station
+    scored.sort(key=lambda s: (s["is_clean"], s["min_dist"]), reverse=True)
+
+    best = scored[0]
+    optimal_df = best["df"]
+    clearance_hz = int(round(best["min_dist"] * 2))
+
+    # Auto-dispatch Configure packet if enabled and collision occurs or slot changes
+    if tx_optimize_enabled and target_addr:
+        should_send = (not current_tx_clear or abs(optimal_df - last_opt) >= 50)
+        if should_send and (now - last_send > 6.0):
+            send_wsjt_configure_rx_df(optimal_df)
+            with state.lock:
+                state.last_optimized_rx_df = optimal_df
+                state.last_tx_optimize_send_time = now
+
+    return {
+        "enabled": tx_optimize_enabled,
+        "optimal_df": optimal_df,
+        "clearance_hz": clearance_hz,
+        "current_tx_df": effective_tx,
+        "current_tx_clear": current_tx_clear,
+        "active_signals_60s": len(recent)
+    }
+
 def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, message: str):
+    with state.lock:
+        state.passband_decodes.append({
+            "timestamp": time.time(),
+            "df": df,
+            "snr": snr,
+            "qtime_ms": qtime_ms
+        })
+        if len(state.passband_decodes) > 300:
+            state.passband_decodes = state.passband_decodes[-300:]
+
     call, grid, is_cq = extract_call_and_grid(message)
     if not call or not grid:
         return
@@ -806,6 +921,8 @@ def udp_listener_thread():
                             freq_changed = (state.dial_freq_hz != dial_freq)
                             band_changed = (old_band != new_band and bool(old_band))
                             state.dial_freq_hz = dial_freq
+                            state.rx_df = rx_df
+                            state.tx_df = tx_df
                             state.mode = mode
                             if de_call: state.de_call = de_call
                             if de_grid: state.de_grid = de_grid
@@ -816,6 +933,7 @@ def udp_listener_thread():
                             state.decoding = dec
                             if band_changed:
                                 state.decodes.clear()
+                                state.passband_decodes.clear()
                             if state.pattern_manager and (freq_changed or state.pattern_manager.active_pattern is None):
                                 state.pattern_manager.set_frequency(dial_freq / 1e6)
 
@@ -912,6 +1030,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 solar_payload["active_group"] = solar_group
                 solar_payload["active_condition"] = band_cond
 
+                passband_info = analyze_passband(state.tx_df)
+
                 payload = {
                     "connected": is_connected,
                     "dial_freq_hz": state.dial_freq_hz,
@@ -924,6 +1044,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     "tx_enabled": state.tx_enabled,
                     "transmitting": state.transmitting,
                     "decoding": state.decoding,
+                    "rx_df": state.rx_df,
+                    "tx_df": state.tx_df,
+                    "tx_freq_optimize": state.tx_freq_optimize,
+                    "passband": passband_info,
                     "solar": solar_payload,
                     "pattern": {
                         "filename": pattern_file,
@@ -1021,11 +1145,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         elif self.path == "/api/clear":
             with state.lock:
                 state.decodes.clear()
+                state.passband_decodes.clear()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             return
+
+        elif self.path == "/api/tx-optimize/apply":
+            try:
+                params = json.loads(body) if body else {}
+                target_df = int(params.get("df", 0))
+                if target_df <= 0:
+                    opt = analyze_passband(state.tx_df)
+                    target_df = opt["optimal_df"]
+                success = send_wsjt_configure_rx_df(target_df)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": success, "applied_df": target_df}).encode("utf-8"))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                return
 
         elif self.path == "/api/settings":
             try:
@@ -1035,13 +1180,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         state.cq_only = bool(params["cq_only"])
                     if "hide_worked" in params:
                         state.hide_worked = bool(params["hide_worked"])
+                    if "tx_freq_optimize" in params:
+                        state.tx_freq_optimize = bool(params["tx_freq_optimize"])
+                        if state.tx_freq_optimize:
+                            opt = analyze_passband(state.tx_df)
+                            send_wsjt_configure_rx_df(opt["optimal_df"])
+                            state.last_optimized_rx_df = opt["optimal_df"]
+                            state.last_tx_optimize_send_time = time.time()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({
                     "success": True,
                     "cq_only": state.cq_only,
-                    "hide_worked": state.hide_worked
+                    "hide_worked": state.hide_worked,
+                    "tx_freq_optimize": state.tx_freq_optimize
                 }).encode("utf-8"))
                 return
             except Exception as e:

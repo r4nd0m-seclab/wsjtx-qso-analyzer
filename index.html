@@ -324,11 +324,26 @@
             <input type="checkbox" id="cq-only-toggle" checked onchange="toggleCqOnly(this.checked)" style="accent-color: var(--primary); width: 15px; height: 15px; cursor: pointer;">
             <span><b>CQ Only</b></span>
           </label>
-          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: #c084fc; margin-right: 0.65rem; user-select: none;">
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: #c084fc; margin-right: 0.5rem; user-select: none;">
             <input type="checkbox" id="hide-worked-toggle" checked onchange="toggleHideWorked(this.checked)" style="accent-color: #a855f7; width: 15px; height: 15px; cursor: pointer;">
             <span><b>Hide Worked (B4)</b></span>
           </label>
-          <button class="btn btn-primary" onclick="injectSimulate()">Inject Test Decodes</button>
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: #34d399; margin-right: 0.5rem; user-select: none;" title="Detects underused FT8 sub-frequencies in the last 60s and sets WSJT-X Rx DF to the clearest open slot (press 'Tx &lt;- Rx' or F11 in WSJT-X to lock Tx)">
+            <input type="checkbox" id="tx-optimize-toggle" onchange="toggleTxOptimize(this.checked)" style="accent-color: #10b981; width: 15px; height: 15px; cursor: pointer;">
+            <span><b>TX Freq Optimize</b></span>
+          </label>
+          <span id="tx-opt-pill" style="display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.78rem; background: #0f172a; border: 1px solid var(--border); padding: 0.22rem 0.55rem; border-radius: 5px; margin-right: 0.5rem; user-select: none;">
+            <span style="color: var(--text-muted);">TX:</span>
+            <b id="tx-curr-freq" style="color: #fff;">1500 Hz</b>
+            <span id="tx-clear-badge" class="badge" style="background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); font-size: 0.68rem; padding: 0.1rem 0.35rem;">✓ CLEAR</span>
+            <span style="color: var(--border);">|</span>
+            <span style="color: var(--text-muted);">Opt:</span>
+            <b id="tx-opt-freq" style="color: #38bdf8; cursor: pointer;" title="Click to send recommended frequency to WSJT-X Rx DF" onclick="applyTxOptimizeManual()">-- Hz</b>
+            <span id="tx-opt-width" style="font-size: 0.72rem; color: var(--text-muted);">(0 Hz)</span>
+            <button class="btn" id="btn-apply-tx-opt" onclick="applyTxOptimizeManual()" style="padding: 0.12rem 0.45rem; font-size: 0.7rem; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3); margin-left: 0.2rem;" title="Set WSJT-X Rx DF to this frequency (F11)">
+              Set Rx (F11)
+            </button>
+          </span>
           <button class="btn" onclick="clearDecodes()">Clear</button>
         </div>
       </div>
@@ -354,10 +369,7 @@
           <tbody id="decodes-tbody">
             <tr>
               <td colspan="12" style="text-align: center; color: var(--text-muted); padding: 3rem;">
-                Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...<br>
-                <span style="font-size: 0.8rem; margin-top: 0.5rem; display: inline-block;">
-                  (Click <b>"Inject Test Decodes"</b> above to view screenshot benchmark data)
-                </span>
+                Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...
               </td>
             </tr>
           </tbody>
@@ -465,6 +477,40 @@
       }).catch(e => console.error(e));
       renderTable(currentDecodes);
       renderRadar(antennaPatternSlice, currentDecodes);
+    }
+
+    // Toggle TX Frequency Optimizer
+    function toggleTxOptimize(checked) {
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tx_freq_optimize: checked })
+      }).then(r => r.json()).then(res => {
+        if (res.success) {
+          if (checked) {
+            showToast('✓ TX Freq Optimize active: monitoring 60s passband for clearest slot');
+          } else {
+            showToast('TX Freq Optimize disabled');
+          }
+        }
+      }).catch(e => console.error(e));
+    }
+
+    // Manually push recommended or clicked frequency to WSJT-X Rx DF
+    function applyTxOptimizeManual(targetDf = 0) {
+      fetch('/api/tx-optimize/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ df: targetDf })
+      }).then(r => r.json()).then(res => {
+        if (res.success) {
+          showToast(`✓ Set WSJT-X Rx DF to ${res.applied_df} Hz (Press 'Tx <- Rx' or F11 in WSJT-X to lock Tx)`);
+        } else {
+          showToast(`Error: ${res.error || 'Failed'}`, true);
+        }
+      }).catch(e => {
+        showToast(`Network error: ${e}`, true);
+      });
     }
 
     // UTC Clock
@@ -649,6 +695,39 @@
           }
         }
 
+        // Passband & TX Frequency Optimization
+        if (data.passband) {
+          const pb = data.passband;
+          const optToggle = document.getElementById('tx-optimize-toggle');
+          if (optToggle && document.activeElement !== optToggle) {
+            optToggle.checked = !!pb.enabled;
+          }
+
+          const currFreqEl = document.getElementById('tx-curr-freq');
+          if (currFreqEl) currFreqEl.innerText = `${pb.current_tx_df} Hz`;
+
+          const clearBadge = document.getElementById('tx-clear-badge');
+          if (clearBadge) {
+            if (pb.current_tx_clear) {
+              clearBadge.innerText = '✓ CLEAR';
+              clearBadge.style.background = 'rgba(16, 185, 129, 0.2)';
+              clearBadge.style.color = '#34d399';
+              clearBadge.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+            } else {
+              clearBadge.innerText = '⚠️ OCCUPIED';
+              clearBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+              clearBadge.style.color = '#f87171';
+              clearBadge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+            }
+          }
+
+          const optFreqEl = document.getElementById('tx-opt-freq');
+          if (optFreqEl) optFreqEl.innerText = `${pb.optimal_df} Hz`;
+
+          const optWidthEl = document.getElementById('tx-opt-width');
+          if (optWidthEl) optWidthEl.innerText = `(${pb.clearance_hz || pb.slot_width_hz || 0} Hz clear)`;
+        }
+
         // Decodes Table
         currentDecodes = data.decodes || [];
         renderTable(currentDecodes);
@@ -674,10 +753,7 @@
       if (!filtered || filtered.length === 0) {
         const msg = (decodes && decodes.length > 0)
           ? `No matching candidates (${decodes.length} decodes filtered by CQ Only or Hide Worked). Adjust filters above.`
-          : `Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...<br>
-             <span style="font-size: 0.8rem; margin-top: 0.5rem; display: inline-block;">
-               (Click <b>"Inject Test Decodes"</b> above to view benchmark data)
-             </span>`;
+          : `Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...`;
         tbody.innerHTML = `
           <tr>
             <td colspan="12" style="text-align: center; color: var(--text-muted); padding: 3rem;">
@@ -807,11 +883,6 @@
       } catch (e) {
         showToast(`Network error: ${e}`, true);
       }
-    }
-
-    async function injectSimulate() {
-      await fetch('/api/simulate', { method: 'POST' });
-      pollState();
     }
 
     async function clearDecodes() {

@@ -35,7 +35,7 @@ A containerized, real-time ham radio station companion that listens to **WSJT-X 
 5. **Diurnal F2 Layer Adaptation:** Adjusts virtual reflection height ($h_v = 280\text{ km}$ day, $350\text{ km}$ night) based on solar elevation angle, accurately reflecting nighttime antenna gain boosts.
 6. **Interactive 1-Click Call:** Clicking **"CALL"** sends a Type 4 `Reply` UDP packet to WSJT-X, populating the DX Call and scheduling transmission on the next slot.
 7. **Antenna Directivity Radar:** HTML5 Canvas polar radar plot displaying the antenna's radiation envelope alongside plotted decoded station bearings.
-8. **Test Simulation Mode:** Built-in **"Inject Test Decodes"** button populates benchmark decodes instantly without requiring an active radio or on-air signals.
+8. **TX Passband Optimization:** Monitors rolling 60-second passband activity to detect sub-frequency collisions and direct WSJT-X to the clearest open transmission slot.
 
 ---
 
