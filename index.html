@@ -144,6 +144,26 @@
       color: #0f172a;
     }
 
+    .table-container {
+      max-height: 515px;
+      overflow-y: auto;
+      overflow-x: auto;
+    }
+    .table-container::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    .table-container::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, 0.6);
+    }
+    .table-container::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+    .table-container::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -151,11 +171,15 @@
       text-align: left;
     }
     th {
-      background: rgba(15, 23, 42, 0.6);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #151e31;
       color: var(--text-muted);
       font-weight: 600;
       padding: 0.65rem 0.85rem;
       border-bottom: 1px solid var(--border);
+      box-shadow: inset 0 -1px 0 var(--border);
       text-transform: uppercase;
       font-size: 0.72rem;
       letter-spacing: 0.04em;
@@ -293,7 +317,7 @@
       <div class="card-header">
         <div class="card-title">
           <span>Target Candidate Prioritization</span>
-          <span id="candidate-count" style="font-size: 0.78rem; font-weight: 500; color: var(--primary); margin-left: 0.35rem;">(Top 10 Ranked)</span>
+          <span id="candidate-count" style="font-size: 0.78rem; font-weight: 500; color: var(--primary); margin-left: 0.35rem;">(0 Candidates)</span>
         </div>
         <div class="btn-group" style="align-items: center;">
           <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: var(--text-main); margin-right: 0.5rem; user-select: none;">
@@ -309,7 +333,7 @@
         </div>
       </div>
 
-      <div style="overflow-x: auto;">
+      <div class="table-container">
         <table id="decodes-table">
           <thead>
             <tr>
@@ -641,16 +665,13 @@
       let filtered = decodes || [];
       if (cqOnlyFilter) filtered = filtered.filter(d => d.is_cq);
       if (hideWorkedFilter) filtered = filtered.filter(d => !d.worked_band);
-      const top10 = filtered.slice(0, 10);
 
       const countEl = document.getElementById('candidate-count');
       if (countEl) {
-        countEl.innerText = filtered.length > 10
-          ? `(Top 10 of ${filtered.length} Candidates)`
-          : `(${top10.length} Candidate${top10.length === 1 ? '' : 's'})`;
+        countEl.innerText = `(${filtered.length} Candidate${filtered.length === 1 ? '' : 's'})`;
       }
 
-      if (!top10 || top10.length === 0) {
+      if (!filtered || filtered.length === 0) {
         const msg = (decodes && decodes.length > 0)
           ? `No matching candidates (${decodes.length} decodes filtered by CQ Only or Hide Worked). Adjust filters above.`
           : `Awaiting incoming FT8 decodes from WSJT-X on UDP port 2237...<br>
@@ -667,7 +688,7 @@
       }
 
       let html = '';
-      top10.forEach((d, idx) => {
+      filtered.forEach((d, idx) => {
         let badgeClass = 'badge-marginal';
         if (d.rec === 'EXCELLENT') badgeClass = 'badge-excellent';
         else if (d.rec === 'GOOD') badgeClass = 'badge-good';
@@ -698,7 +719,7 @@
                 CALL
               </button>
             </td>
-            <td><span class="callsign">${d.call}</span>${typeBadge}${b4Badge}</td>
+            <td><span class="callsign">${d.call}</span>${typeBadge}</td>
             <td><span class="grid">${d.grid}</span></td>
             <td>
               <span class="badge ${d.is_dx ? 'badge-dx' : 'badge-state'}" title="${d.loc_full || d.country || ''}">
@@ -715,7 +736,7 @@
             <td>${snrSign}${d.snr} dB</td>
             <td>${margSign}${d.rx_margin} dB</td>
             <td>
-              <span class="badge ${badgeClass}">${d.score} (${d.rec})</span>
+              <span class="badge ${badgeClass}">${d.score} (${d.rec})</span>${b4Badge}
             </td>
           </tr>
         `;
