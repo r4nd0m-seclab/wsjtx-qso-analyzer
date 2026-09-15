@@ -702,13 +702,28 @@
           ? `<span style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;">CQ</span>`
           : `<span style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; margin-left: 0.35rem;">QSO</span>`;
 
-        let b4Badge = '';
+        let workedBadge = '';
         if (d.worked_band) {
           const q = d.last_qso || {};
-          b4Badge = `<span style="background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="Worked before on ${q.date || ''} ${q.time || ''} (${q.band || ''})">B4 (${q.band || 'BAND'})</span>`;
-        } else if (d.worked_any) {
-          const q = d.last_qso || {};
-          b4Badge = `<span style="background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.3); padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.68rem; margin-left: 0.35rem;" title="Worked before on ${q.band || ''} (${q.date || ''})">NEW BAND (WKD ${q.band || ''})</span>`;
+          workedBadge = `<span style="background: rgba(168, 85, 247, 0.25); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.5); padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="Worked on this band (${q.band || 'current'}) on ${q.date || ''} ${q.time || ''}">B4</span>`;
+        }
+
+        let otherBandsBadge = '';
+        const otherCount = d.other_bands_count != null ? d.other_bands_count : (d.other_bands ? d.other_bands.length : (d.worked_any && !d.worked_band ? 1 : 0));
+        if (otherCount > 0) {
+          const bandsList = (d.other_bands || []).join(', ');
+          const tooltip = `Worked on ${otherCount} other band${otherCount > 1 ? 's' : ''}${bandsList ? ': ' + bandsList : (d.last_qso ? ': ' + d.last_qso.band : '')}`;
+          otherBandsBadge = `<span style="background: rgba(168, 85, 247, 0.25); color: #d8b4fe; border: 1px solid rgba(168, 85, 247, 0.45); padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="${tooltip}">+${otherCount}</span>`;
+        }
+
+        let timeEmoji = '☀️';
+        let timeTitle = 'Day (F2 layer hv ~280 km)';
+        if (d.path_state === 'TWILIGHT') {
+          timeEmoji = '🌇';
+          timeTitle = 'Twilight / Terminator (F2 layer hv ~310 km)';
+        } else if (d.path_state === 'NIGHT') {
+          timeEmoji = '🌙';
+          timeTitle = 'Night (F2 layer hv ~350 km)';
         }
 
         html += `
@@ -719,7 +734,7 @@
                 CALL
               </button>
             </td>
-            <td><span class="callsign">${d.call}</span>${typeBadge}</td>
+            <td><span class="callsign">${d.call}</span>${typeBadge}${workedBadge}${otherBandsBadge}</td>
             <td><span class="grid">${d.grid}</span></td>
             <td>
               <span class="badge ${d.is_dx ? 'badge-dx' : 'badge-state'}" title="${d.loc_full || d.country || ''}">
@@ -731,12 +746,12 @@
             </td>
             <td>${(d.dist_mi || Math.round(d.dist_km * 0.621371)).toLocaleString()} mi</td>
             <td>${d.az}°</td>
-            <td>${d.el}° (${d.path_state})</td>
+            <td title="${timeTitle}">${d.el}° <span style="font-size: 0.85rem; vertical-align: middle;">${timeEmoji}</span></td>
             <td style="font-weight: 600; color: ${d.gain >= -3 ? '#38bdf8' : '#f87171'}">${gainSign}${d.gain} dBi</td>
             <td>${snrSign}${d.snr} dB</td>
             <td>${margSign}${d.rx_margin} dB</td>
             <td>
-              <span class="badge ${badgeClass}">${d.score} (${d.rec})</span>${b4Badge}
+              <span class="badge ${badgeClass}">${d.score} (${d.rec})</span>
             </td>
           </tr>
         `;

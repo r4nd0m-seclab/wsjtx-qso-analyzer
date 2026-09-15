@@ -245,8 +245,8 @@ class WsjtxLogWatcher:
             print(f"[LogWatcher] Error reading {self.log_path}: {e}")
             return False
 
-    def check_worked(self, call: str, current_band: str) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
-        """Returns (worked_current_band, worked_any_band, last_qso)."""
+    def check_worked(self, call: str, current_band: str) -> Tuple[bool, bool, Optional[Dict[str, Any]], List[str]]:
+        """Returns (worked_current_band, worked_any_band, last_qso, other_bands)."""
         self.reload_if_changed()
         call_clean = call.strip().upper()
         base_call = call_clean.split("/")[0] if "/" in call_clean else call_clean
@@ -260,7 +260,8 @@ class WsjtxLogWatcher:
             qsos_any = self.worked_any.get(base_call)
 
         last_qso = qso_band or (qsos_any[-1] if qsos_any else None)
-        return bool(qso_band), bool(qsos_any), last_qso
+        other_bands = sorted(list({q["band"] for q in (qsos_any or []) if q.get("band") and q["band"] != current_band}))
+        return bool(qso_band), bool(qsos_any), last_qso, other_bands
 
 # -----------------------------------------------------------------------------
 # Country & State Code Resolver (DXCC & Maidenhead Grid Mapping)
@@ -694,8 +695,8 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
     }
 
     # Check if worked before
-    worked_band, worked_any, last_qso = (
-        log_watcher.check_worked(call, current_band) if log_watcher else (False, False, None)
+    worked_band, worked_any, last_qso, other_bands = (
+        log_watcher.check_worked(call, current_band) if log_watcher else (False, False, None, [])
     )
     
     # Geomagnetic loss for high latitude if Kp > 2
@@ -745,6 +746,8 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
         "is_cq": is_cq,
         "worked_band": worked_band,
         "worked_any": worked_any,
+        "other_bands": other_bands,
+        "other_bands_count": len(other_bands),
         "last_qso": last_qso,
         "qtime_ms": qtime_ms,
         "mode": mode,
@@ -1002,8 +1005,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 (2*3600*1000 + 13*60*1000 + 15000, -13, 0.2, 1735, "~", "CQ KF7FNC CN85"),
                 (2*3600*1000 + 13*60*1000 + 15000,  -7, 0.4, 2005, "~", "CQ KE6RAD CM97"),
                 (2*3600*1000 + 13*60*1000 + 15000,  -6, 0.2, 2218, "~", "CQ N7SBL CN85"),
+                (2*3600*1000 + 13*60*1000 + 15000, -10, 0.3, 1550, "~", "CQ AE6CH CM87"),
                 (2*3600*1000 + 13*60*1000 + 15000, -14, 0.3, 1420, "~", "CQ JA1ABC PM95"),
-                (2*3600*1000 + 13*60*1000 + 15000, -16, 0.4, 1680, "~", "CQ DL1ABC JO31")
+                (2*3600*1000 + 13*60*1000 + 15000, -16, 0.4, 1680, "~", "CQ DL1ABC JO31"),
+                (2*3600*1000 + 13*60*1000 + 15000, -11, 0.4, 1920, "~", "CQ VK4XA QG62")
             ]
             for t, snr, dt, df, m, msg in simulated:
                 process_decode(t, snr, dt, df, m, msg)
