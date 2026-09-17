@@ -330,10 +330,10 @@
             <input type="checkbox" id="hide-worked-toggle" checked onchange="toggleHideWorked(this.checked)" style="accent-color: #a855f7; width: 15px; height: 15px; cursor: pointer;">
             <span><b>Hide Worked (B4)</b></span>
           </label>
-          <span id="psk-stat-pill" style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; background: #0f172a; border: 1px solid rgba(56, 189, 248, 0.35); padding: 0.22rem 0.55rem; border-radius: 5px; margin-right: 0.5rem; user-select: none;" title="Toggle PSK Reporter ground-truth propagation scoring">
+          <span id="psk-stat-pill" style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; background: #0f172a; border: 1px solid rgba(56, 189, 248, 0.35); padding: 0.22rem 0.55rem; border-radius: 5px; margin-right: 0.5rem; user-select: none;" title="Toggle PSK-RPT ground-truth propagation scoring">
             <label style="display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; color: #38bdf8; margin: 0;">
               <input type="checkbox" id="psk-reporter-toggle" checked onchange="togglePskReporter(this.checked)" style="accent-color: #38bdf8; width: 15px; height: 15px; cursor: pointer;">
-              <span><b>📡 PSK:</b></span>
+              <span><b>PSK-RPT:</b></span>
               <span id="psk-spots-count" style="color: #34d399; font-weight: 600;">--</span>
               <span id="psk-age-label" style="font-size: 0.72rem; color: var(--text-muted);"></span>
             </label>
@@ -498,9 +498,9 @@
       }).then(r => r.json()).then(res => {
         if (res.success) {
           if (checked) {
-            showToast('✓ PSK Reporter enabled (observed propagation scoring)');
+            showToast('✓ PSK-RPT enabled (observed propagation scoring)');
           } else {
-            showToast('PSK Reporter disabled (model-only scoring)');
+            showToast('PSK-RPT disabled (model-only scoring)');
           }
         }
       }).catch(e => console.error(e));
