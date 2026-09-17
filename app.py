@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from typing import Dict, Tuple, List, Optional, Any
@@ -52,12 +53,14 @@ sys.stderr = SafeStream(sys.stderr)
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 UDP_PORT = int(os.environ.get("UDP_PORT", "2237"))
 DEFAULT_HOME_GRID = os.environ.get("HOME_GRID", "EL09")
+DEFAULT_MY_CALL = os.environ.get("MY_CALL", os.environ.get("CALLSIGN", "K5JEE"))
 DEFAULT_TX_POWER_W = float(os.environ.get("TX_POWER_W", "100.0"))
 NORTH_OFFSET_DEG = float(os.environ.get("NORTH_OFFSET_DEG", "0.0"))
 PATTERNS_DIR = os.environ.get("PATTERNS_DIR", "patterns")
 DEFAULT_CQ_ONLY = os.environ.get("CQ_ONLY", "true").lower() in ("true", "1", "yes")
 DEFAULT_HIDE_WORKED = os.environ.get("HIDE_WORKED", "true").lower() in ("true", "1", "yes")
-DEFAULT_TX_FREQ_OPTIMIZE = os.environ.get("TX_FREQ_OPTIMIZE", "false").lower() in ("true", "1", "yes")
+DEFAULT_TX_FREQ_OPTIMIZE = os.environ.get("TX_FREQ_OPTIMIZE", "true").lower() in ("true", "1", "yes")
+DEFAULT_PSK_REPORTER = os.environ.get("PSK_REPORTER", "true").lower() in ("true", "1", "yes")
 WSJTX_DATA_DIR = os.environ.get("WSJTX_DATA_DIR", "/wsjtx-data")
 
 # -----------------------------------------------------------------------------
@@ -828,6 +831,234 @@ def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], b
     return None, None, False, None
 
 # -----------------------------------------------------------------------------
+# PSK Reporter Ground-Truth Propagation Service
+# -----------------------------------------------------------------------------
+class PskReporterManager:
+    """
+    Fetches and caches ground-truth FT8 reception reports from PSK Reporter.
+    Provides two-way empirical link margin verification and regional path validation.
+    """
+    def __init__(self, callsign: str = "K5JEE", min_interval_s: float = 300.0):
+        self.callsign = callsign.upper()
+        self.min_interval_s = min_interval_s
+        self.last_poll_time = 0.0
+        self.last_poll_status = "idle"
+        self.last_poll_error = ""
+        self.lock = threading.RLock()
+        
+        self.total_spots = 0
+        self.last_update_utc = ""
+        
+        # Indexed lookups:
+        # (receiver_call, band) -> spot dict
+        self.by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # receiver_call -> most recent spot dict across all bands
+        self.by_call_latest: Dict[str, Dict[str, Any]] = {}
+        # (band, grid[:4]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
+        self.by_band_grid4: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # (band, grid[:2]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
+        self.by_band_grid2: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # band -> spot count
+        self.band_counts: Dict[str, int] = {}
+        
+    def should_poll(self) -> bool:
+        return (time.time() - self.last_poll_time) >= self.min_interval_s
+
+    def fetch_reports(self, callsign: Optional[str] = None) -> bool:
+        target_call = (callsign or self.callsign).strip().upper()
+        if not target_call:
+            return False
+            
+        url = f"https://retrieve.pskreporter.info/query?senderCallsign={target_call}&flowStartSeconds=-3600&rronly=1"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "WSJTX-QSO-Companion/1.0 (Amateur Radio QSO Success Estimator)"}
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                xml_data = resp.read()
+        except Exception as e:
+            with self.lock:
+                self.last_poll_status = "error"
+                self.last_poll_error = str(e)
+            print(f"[PSKReporter] Query failed for {target_call}: {e}")
+            return False
+
+        try:
+            root = ET.fromstring(xml_data)
+        except Exception as e:
+            with self.lock:
+                self.last_poll_status = "parse_error"
+                self.last_poll_error = str(e)
+            print(f"[PSKReporter] XML parse error: {e}")
+            return False
+
+        reports = root.findall(".//receptionReport")
+        now = time.time()
+        
+        new_by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        new_by_call_latest: Dict[str, Dict[str, Any]] = {}
+        grid4_acc: Dict[Tuple[str, str], List[int]] = {}
+        grid2_acc: Dict[Tuple[str, str], List[int]] = {}
+        new_band_counts: Dict[str, int] = {}
+
+        for r in reports:
+            rcall = r.attrib.get("receiverCallsign", "").strip().upper()
+            if not rcall:
+                continue
+            rgrid = r.attrib.get("receiverLocator", "").strip().upper()
+            try:
+                freq_hz = float(r.attrib.get("frequency", 0))
+            except (ValueError, TypeError):
+                freq_hz = 0.0
+            try:
+                snr = int(r.attrib.get("sNR", -99))
+            except (ValueError, TypeError):
+                snr = -99
+            try:
+                flow_sec = int(r.attrib.get("flowStartSeconds", 0))
+            except (ValueError, TypeError):
+                flow_sec = int(now)
+
+            band = get_band_name(freq_hz / 1e6) if freq_hz > 0 else "unknown"
+            new_band_counts[band] = new_band_counts.get(band, 0) + 1
+
+            spot = {
+                "call": rcall,
+                "grid": rgrid,
+                "snr": snr,
+                "freq_hz": freq_hz,
+                "band": band,
+                "flow_sec": flow_sec,
+                "age_min": max(0, round((now - flow_sec) / 60.0))
+            }
+
+            # Keyed by (call, band) - keep most recent
+            call_band_key = (rcall, band)
+            if call_band_key not in new_by_call_band or flow_sec > new_by_call_band[call_band_key]["flow_sec"]:
+                new_by_call_band[call_band_key] = spot
+
+            # Keyed by call - keep most recent across all bands
+            if rcall not in new_by_call_latest or flow_sec > new_by_call_latest[rcall]["flow_sec"]:
+                new_by_call_latest[rcall] = spot
+
+            # Regional accumulation
+            if len(rgrid) >= 4:
+                g4 = (band, rgrid[:4])
+                grid4_acc.setdefault(g4, []).append(snr)
+            if len(rgrid) >= 2:
+                g2 = (band, rgrid[:2])
+                grid2_acc.setdefault(g2, []).append(snr)
+
+        # Summarize regional grids
+        new_grid4: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (b, g4), snrs in grid4_acc.items():
+            new_grid4[(b, g4)] = {
+                "count": len(snrs),
+                "avg_snr": round(sum(snrs) / len(snrs), 1),
+                "max_snr": max(snrs),
+                "min_snr": min(snrs)
+            }
+
+        new_grid2: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (b, g2), snrs in grid2_acc.items():
+            new_grid2[(b, g2)] = {
+                "count": len(snrs),
+                "avg_snr": round(sum(snrs) / len(snrs), 1),
+                "max_snr": max(snrs),
+                "min_snr": min(snrs)
+            }
+
+        with self.lock:
+            self.callsign = target_call
+            self.total_spots = len(reports)
+            self.last_poll_time = now
+            self.last_poll_status = "ok"
+            self.last_poll_error = ""
+            self.last_update_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            self.by_call_band = new_by_call_band
+            self.by_call_latest = new_by_call_latest
+            self.by_band_grid4 = new_grid4
+            self.by_band_grid2 = new_grid2
+            self.band_counts = new_band_counts
+
+        print(f"[PSKReporter] Updated for {target_call}: {len(reports)} spots across {len(new_band_counts)} bands ({dict(new_band_counts)})")
+        return True
+
+    def lookup(self, call: str, grid: str, current_band: str) -> Dict[str, Any]:
+        c = call.strip().upper()
+        g = grid.strip().upper()
+        b = current_band.strip().lower()
+
+        with self.lock:
+            # 1. Exact direct match on active band
+            direct_band = self.by_call_band.get((c, b))
+            if direct_band:
+                return {
+                    "match": "direct_band",
+                    "snr": direct_band["snr"],
+                    "band": direct_band["band"],
+                    "age_min": direct_band["age_min"],
+                    "grid": direct_band["grid"]
+                }
+
+            # 2. Exact direct match on another band
+            direct_any = self.by_call_latest.get(c)
+            if direct_any:
+                return {
+                    "match": "direct_other",
+                    "snr": direct_any["snr"],
+                    "band": direct_any["band"],
+                    "age_min": direct_any["age_min"],
+                    "grid": direct_any["grid"]
+                }
+
+            # 3. 4-character Maidenhead grid match on current band
+            if len(g) >= 4:
+                g4 = g[:4]
+                reg4 = self.by_band_grid4.get((b, g4))
+                if reg4:
+                    return {
+                        "match": "grid4",
+                        "grid": g4,
+                        "spots": reg4["count"],
+                        "avg_snr": reg4["avg_snr"],
+                        "max_snr": reg4["max_snr"]
+                    }
+
+            # 4. 2-character Maidenhead field match on current band
+            if len(g) >= 2:
+                g2 = g[:2]
+                reg2 = self.by_band_grid2.get((b, g2))
+                if reg2:
+                    return {
+                        "match": "grid2",
+                        "grid": g2,
+                        "spots": reg2["count"],
+                        "avg_snr": reg2["avg_snr"],
+                        "max_snr": reg2["max_snr"]
+                    }
+
+            return {"match": "none"}
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self.lock:
+            now = time.time()
+            age_s = max(0, int(now - self.last_poll_time)) if self.last_poll_time > 0 else None
+            age_str = f"{round(age_s / 60)}m ago" if age_s is not None else "never"
+            return {
+                "callsign": self.callsign,
+                "total_spots": self.total_spots,
+                "last_update_utc": self.last_update_utc,
+                "last_poll_time": self.last_poll_time,
+                "age_seconds": age_s,
+                "age_str": age_str,
+                "status": self.last_poll_status,
+                "band_counts": dict(self.band_counts)
+            }
+
+# -----------------------------------------------------------------------------
 # Application State
 # -----------------------------------------------------------------------------
 class State:
@@ -837,7 +1068,7 @@ class State:
         self.last_heartbeat_time = 0.0
         self.dial_freq_hz = 14074000
         self.mode = "FT8"
-        self.de_call = "W5KARS"
+        self.de_call = DEFAULT_MY_CALL
         self.de_grid = DEFAULT_HOME_GRID
         self.dx_call = ""
         self.dx_grid = ""
@@ -852,6 +1083,7 @@ class State:
         self.passband_decodes: List[Dict[str, Any]] = []
         self.cq_only = DEFAULT_CQ_ONLY
         self.hide_worked = DEFAULT_HIDE_WORKED
+        self.psk_reporter = DEFAULT_PSK_REPORTER
         self.wsjt_client_id = "WSJT-X"
         self.wsjt_remote_addr: Optional[Tuple[str, int]] = None
         
@@ -860,6 +1092,7 @@ class State:
         self.pattern_manager: Optional[AntennaPatternManager] = None
         self.log_watcher: Optional[WsjtxLogWatcher] = None
         self.loc_resolver: LocationResolver = LocationResolver()
+        self.psk_manager: Optional[PskReporterManager] = None
 
 state = State()
 
@@ -937,7 +1170,7 @@ def send_wsjt_configure_rx_df(rx_df: int) -> bool:
         print(f"[Configure] Error sending Configure: {e}")
         return False
 
-def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, step_hz: int = 50) -> Dict[str, Any]:
+def analyze_passband(current_tx_df: int, min_hz: int = 300, max_hz: int = 2950, step_hz: int = 10) -> Dict[str, Any]:
     now = time.time()
     with state.lock:
         state.passband_decodes = [d for d in state.passband_decodes if (now - d["timestamp"]) <= 60.0]
@@ -956,8 +1189,19 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
             current_tx_clear = False
             break
 
-    # Candidate 50Hz slots across the operational FT8 passband, descending to favor higher frequencies
-    candidates = list(range(max_hz, min_hz - 1, -step_hz))
+    # Build candidate pool: descending from 2950 Hz down to 300 Hz
+    cand_set = set(range(max_hz, min_hz - 1, -step_hz))
+    
+    # Also evaluate the exact midpoints of gaps between adjacent active signals
+    if recent:
+        recent_dfs = sorted(set(d["df"] for d in recent))
+        for s1, s2 in zip(recent_dfs[:-1], recent_dfs[1:]):
+            if s2 > min_hz and s1 < max_hz:
+                mid = int(round((s1 + s2) / 2))
+                if min_hz <= mid <= max_hz:
+                    cand_set.add(mid)
+
+    candidates = sorted(cand_set, reverse=True)
     scored = []
 
     for f in candidates:
@@ -966,23 +1210,42 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
         else:
             min_dist = 500.0
 
-        is_clean = (min_dist >= 40)
+        # Tier 2: completely clean free slot (min_dist >= 35 Hz -> clearance >= 70 Hz)
+        # Tier 1: marginal gap (min_dist >= 25 Hz)
+        # Tier 0: collision (< 25 Hz)
+        if min_dist >= 35.0:
+            tier = 2
+        elif min_dist >= 25.0:
+            tier = 1
+        else:
+            tier = 0
+
         scored.append({
             "df": f,
             "min_dist": min_dist,
-            "is_clean": is_clean
+            "tier": tier,
+            "is_clean": (tier == 2)
         })
 
-    # Sort candidates: clean slots first, then adequate clearance (>=60 Hz), favoring higher frequencies first
-    scored.sort(key=lambda s: (s["is_clean"], min(s["min_dist"], 60.0), s["df"]), reverse=True)
+    # Heavily favor clean slots close to 2950 and then down:
+    # Tier 2 (clean): primary sort is frequency descending (highest f <= 2950 first!)
+    # Lower tiers: sort by min_dist descending, then frequency descending
+    scored.sort(
+        key=lambda s: (
+            s["tier"],
+            s["df"] if s["tier"] == 2 else s["min_dist"],
+            s["df"]
+        ),
+        reverse=True
+    )
 
     best = scored[0]
     optimal_df = best["df"]
-    clearance_hz = int(round(best["min_dist"] * 2))
+    clearance_hz = min(500, int(round(best["min_dist"] * 2)))
 
-    # Auto-dispatch Configure packet if enabled and collision occurs or slot changes
+    # Auto-dispatch Configure packet if enabled and collision occurs or slot changes significantly
     if tx_optimize_enabled and target_addr:
-        should_send = (not current_tx_clear or abs(optimal_df - last_opt) >= 50)
+        should_send = (not current_tx_clear or abs(optimal_df - last_opt) >= 30)
         if should_send and (now - last_send > 6.0):
             try:
                 send_wsjt_configure_rx_df(optimal_df)
@@ -1001,41 +1264,22 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
         "active_signals_60s": len(recent)
     }
 
-def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, message: str):
-    with state.lock:
-        state.passband_decodes.append({
-            "timestamp": time.time(),
-            "df": df,
-            "snr": snr,
-            "qtime_ms": qtime_ms
-        })
-        if len(state.passband_decodes) > 300:
-            state.passband_decodes = state.passband_decodes[-300:]
-
-    call, grid, is_cq, cq_target = extract_call_and_grid(message)
-    if not call or not grid:
-        return
-
-    with state.lock:
-        home_grid = state.de_grid or DEFAULT_HOME_GRID
-        my_call = state.de_call or "W5KARS"
-        pattern = state.pattern_manager.active_pattern if state.pattern_manager else None
-        current_band = state.pattern_manager.active_band_name if state.pattern_manager else "20m"
-        kp = state.solar.get("kp_index", 2.0)
-        log_watcher = state.log_watcher
-        loc_resolver = state.loc_resolver
-
-    # Check directed CQ restriction (e.g. CQ DX, CQ State, CQ Country, CQ Continent)
-    # If our station does not match the directive, returning the call is restricted and it must not appear in the list
-    if is_cq and cq_target:
-        eligible, match_reason = is_directed_cq_eligible(
-            cq_target, call, grid, my_call, home_grid, loc_resolver
-        )
-        if not eligible:
-            with state.lock:
-                state.decodes.pop(call, None)
-            return
-        
+def calculate_decode_score(
+    call: str,
+    grid: str,
+    snr: int,
+    is_cq: bool,
+    cq_target: Optional[str],
+    home_grid: str,
+    my_call: str,
+    pattern: Optional[MmanaGainPattern],
+    current_band: str,
+    kp: float,
+    log_watcher: Optional[WsjtxLogWatcher],
+    loc_resolver: Optional[LocationResolver],
+    psk_enabled: bool = False,
+    psk_manager: Optional[PskReporterManager] = None
+) -> Optional[Dict[str, Any]]:
     home_lat, home_lon = maidenhead_to_latlon(home_grid)
     rem_lat, rem_lon = maidenhead_to_latlon(grid)
     dist_km, az_deg = great_circle(home_lat, home_lon, rem_lat, rem_lon)
@@ -1068,34 +1312,56 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
         geomag_loss_db = (kp - 2.0) * (rem_lat - 45.0) * 0.15
         
     rx_margin = snr - (-21.0)
+    base_margin = rx_margin + tot_dbi - geomag_loss_db
     
-    # Effective link margin combining SNR above decode threshold, antenna gain pattern, and geomagnetic loss
-    effective_margin = rx_margin + tot_dbi - geomag_loss_db
-    
-    # Normalized score based on link margin (baseline 50 at 0 dB margin, scale to 100)
-    score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5)))
+    psk_info: Dict[str, Any] = {"match": "disabled"}
+    psk_status = ""
+    rec_tag = ""
+
+    if psk_enabled and psk_manager:
+        psk_info = psk_manager.lookup(call, grid, current_band)
+        m_type = psk_info.get("match", "none")
+        if m_type == "direct_band":
+            tx_snr = psk_info["snr"]
+            tx_margin = tx_snr - (-21.0)
+            # Bidirectional link bottleneck: QSO requires both sides to decode successfully
+            two_way_margin = min(rx_margin, tx_margin)
+            effective_margin = two_way_margin + (tot_dbi * 0.3) - (geomag_loss_db * 0.5)
+            # Direct two-way verified confidence bonus (+12 pts)
+            score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5) + 12.0))
+            psk_status = f"2-WAY {tx_snr:+d}dB"
+            rec_tag = " (2-WAY)"
+        elif m_type == "direct_other":
+            tx_snr = psk_info["snr"]
+            effective_margin = base_margin
+            # Heard on another band recently: active station confidence bonus (+5 pts)
+            score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5) + 5.0))
+            psk_status = f"HEARD ({psk_info.get('band', '')})"
+        elif m_type == "grid4":
+            est_tx_margin = psk_info["avg_snr"] - (-21.0)
+            openness_bonus = 6.0 if est_tx_margin >= 0 else 2.0
+            effective_margin = (base_margin * 0.7) + (est_tx_margin * 0.3)
+            score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5) + openness_bonus))
+            psk_status = f"PATH {psk_info.get('grid', '')}"
+        elif m_type == "grid2":
+            effective_margin = base_margin
+            score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5) + 3.0))
+            psk_status = f"PATH {psk_info.get('grid', '')}"
+        else:
+            effective_margin = base_margin
+            score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5)))
+    else:
+        effective_margin = base_margin
+        score = max(5.0, min(100.0, 50.0 + (effective_margin * 2.5)))
+
     if worked_band:
         # Heavily penalize priority for stations already worked on this band
         score = score * 0.35
         rec = "WORKED B4"
     else:
-        rec = "EXCELLENT" if score >= 80 else ("GOOD" if score >= 60 else "MARGINAL")
+        rec = ("EXCELLENT" if score >= 80 else ("GOOD" if score >= 60 else "MARGINAL")) + rec_tag
 
-    entry = {
-        "call": call,
-        "grid": grid,
-        "country": loc["country"],
-        "country_code": loc["country_code"],
-        "state": loc["state"],
-        "state_code": loc["state_code"],
-        "loc_code": loc["loc_code"],
-        "loc_sub": loc["loc_sub"],
-        "loc_full": loc["loc_full"],
-        "is_dx": loc["is_dx"],
-        "message": message,
-        "snr": snr,
-        "df": df,
-        "dt": round(dt, 2),
+    return {
         "dist_km": round(dist_km),
         "dist_mi": round(dist_km * 0.621371),
         "az": round(az_deg, 1),
@@ -1106,16 +1372,107 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
         "hv_km": round(hv_km),
         "score": round(score, 1),
         "rec": rec,
-        "is_cq": is_cq,
-        "cq_target": cq_target,
+        "country": loc["country"],
+        "country_code": loc["country_code"],
+        "state": loc["state"],
+        "state_code": loc["state_code"],
+        "loc_code": loc["loc_code"],
+        "loc_sub": loc["loc_sub"],
+        "loc_full": loc["loc_full"],
+        "is_dx": loc["is_dx"],
         "worked_band": worked_band,
         "worked_any": worked_any,
         "other_bands": other_bands,
         "other_bands_count": len(other_bands),
         "last_qso": last_qso,
+        "psk_info": psk_info,
+        "psk_status": psk_status
+    }
+
+def rescore_all_decodes():
+    """Recalculates scores and recommendations for all active decodes in state."""
+    with state.lock:
+        home_grid = state.de_grid or DEFAULT_HOME_GRID
+        my_call = state.de_call or DEFAULT_MY_CALL
+        pattern = state.pattern_manager.active_pattern if state.pattern_manager else None
+        freq_mhz = round(state.dial_freq_hz / 1e6, 3)
+        band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
+        current_band = band_name or get_band_name(freq_mhz)
+        kp = state.solar.get("kp_index", 2.0)
+        log_watcher = state.log_watcher
+        loc_resolver = state.loc_resolver
+        psk_enabled = state.psk_reporter
+        psk_manager = state.psk_manager
+
+        for call, d in list(state.decodes.items()):
+            calc = calculate_decode_score(
+                d["call"], d["grid"], d["snr"], d.get("is_cq", False), d.get("cq_target"),
+                home_grid, my_call, pattern, current_band, kp, log_watcher, loc_resolver,
+                psk_enabled, psk_manager
+            )
+            if calc:
+                d.update(calc)
+
+def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, message: str):
+    with state.lock:
+        state.passband_decodes.append({
+            "timestamp": time.time(),
+            "df": df,
+            "snr": snr,
+            "qtime_ms": qtime_ms
+        })
+        if len(state.passband_decodes) > 300:
+            state.passband_decodes = state.passband_decodes[-300:]
+
+    call, grid, is_cq, cq_target = extract_call_and_grid(message)
+    if not call or not grid:
+        return
+
+    with state.lock:
+        home_grid = state.de_grid or DEFAULT_HOME_GRID
+        my_call = state.de_call or DEFAULT_MY_CALL
+        pattern = state.pattern_manager.active_pattern if state.pattern_manager else None
+        freq_mhz = round(state.dial_freq_hz / 1e6, 3)
+        band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
+        current_band = band_name or get_band_name(freq_mhz)
+        kp = state.solar.get("kp_index", 2.0)
+        log_watcher = state.log_watcher
+        loc_resolver = state.loc_resolver
+        psk_enabled = state.psk_reporter
+        psk_manager = state.psk_manager
+
+    # Check directed CQ restriction (e.g. CQ DX, CQ State, CQ Country, CQ Continent)
+    # If our station does not match the directive, returning the call is restricted and it must not appear in the list
+    if is_cq and cq_target:
+        eligible, match_reason = is_directed_cq_eligible(
+            cq_target, call, grid, my_call, home_grid, loc_resolver
+        )
+        if not eligible:
+            with state.lock:
+                state.decodes.pop(call, None)
+            return
+
+    calc = calculate_decode_score(
+        call, grid, snr, is_cq, cq_target,
+        home_grid, my_call, pattern, current_band, kp, log_watcher, loc_resolver,
+        psk_enabled, psk_manager
+    )
+    if not calc:
+        return
+
+    entry = {
+        "call": call,
+        "grid": grid,
+        "message": message,
+        "snr": snr,
+        "df": df,
+        "dt": round(dt, 2),
+        "is_cq": is_cq,
+        "cq_target": cq_target,
         "qtime_ms": qtime_ms,
         "mode": mode,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        **calc
     }
 
     with state.lock:
@@ -1173,7 +1530,10 @@ def udp_listener_thread():
                             state.rx_df = rx_df
                             state.tx_df = tx_df
                             state.mode = mode
-                            if de_call: state.de_call = de_call
+                            if de_call:
+                                state.de_call = de_call
+                                if state.psk_manager:
+                                    state.psk_manager.callsign = de_call
                             if de_grid: state.de_grid = de_grid
                             state.dx_call = dx_call
                             state.dx_grid = dx_grid
@@ -1218,6 +1578,23 @@ def space_weather_poller():
             print(f"[SpaceWeather] Error: {e}")
         time.sleep(1800) # update every 30 minutes
 
+def psk_reporter_poller():
+    """Background poller for PSK Reporter ground-truth reception reports."""
+    time.sleep(2)
+    while True:
+        try:
+            with state.lock:
+                enabled = state.psk_reporter
+                callsign = state.de_call or DEFAULT_MY_CALL
+                mgr = state.psk_manager
+
+            if enabled and mgr and mgr.should_poll():
+                if mgr.fetch_reports(callsign):
+                    rescore_all_decodes()
+        except Exception as e:
+            print(f"[PSKReporter] Poller loop error: {e}")
+        time.sleep(10)
+
 # -----------------------------------------------------------------------------
 # Web Request Handler & REST API
 # -----------------------------------------------------------------------------
@@ -1251,6 +1628,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 self.end_headers()
                 self.wfile.write(content)
             except Exception as e:
@@ -1337,6 +1717,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         },
                         "cq_only": state.cq_only,
                         "hide_worked": state.hide_worked,
+                        "psk_reporter": state.psk_reporter,
+                        "psk_stats": state.psk_manager.get_stats() if state.psk_manager else {},
                         "worked_total": len(state.log_watcher.worked_any) if state.log_watcher else 0,
                         "decodes": ranked_list,
                         "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1466,11 +1848,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             send_wsjt_configure_rx_df(opt["optimal_df"])
                             state.last_optimized_rx_df = opt["optimal_df"]
                             state.last_tx_optimize_send_time = time.time()
+                    if "psk_reporter" in params:
+                        new_val = bool(params["psk_reporter"])
+                        state.psk_reporter = new_val
+                        rescore_all_decodes()
+                        if new_val and state.psk_manager and (time.time() - state.psk_manager.last_poll_time > 300.0):
+                            target_c = state.de_call or DEFAULT_MY_CALL
+                            mgr = state.psk_manager
+                            def _fetch_bg():
+                                if mgr.fetch_reports(target_c):
+                                    rescore_all_decodes()
+                            threading.Thread(target=_fetch_bg, daemon=True).start()
                 self._send_json(200, {
                     "success": True,
                     "cq_only": state.cq_only,
                     "hide_worked": state.hide_worked,
-                    "tx_freq_optimize": state.tx_freq_optimize
+                    "tx_freq_optimize": state.tx_freq_optimize,
+                    "psk_reporter": state.psk_reporter
                 })
                 return
             except Exception as e:
@@ -1499,6 +1893,9 @@ def main():
     # Initialize Country & State Location Resolver
     state.loc_resolver = LocationResolver()
     
+    # Initialize PSK Reporter Ground-Truth Manager
+    state.psk_manager = PskReporterManager(callsign=state.de_call or DEFAULT_MY_CALL)
+    
     # Fetch initial solar data
     state.solar = SpaceWeather.fetch()
     
@@ -1508,6 +1905,9 @@ def main():
     
     t_sw = threading.Thread(target=space_weather_poller, daemon=True)
     t_sw.start()
+    
+    t_psk = threading.Thread(target=psk_reporter_poller, daemon=True)
+    t_psk.start()
     
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), DashboardHandler)

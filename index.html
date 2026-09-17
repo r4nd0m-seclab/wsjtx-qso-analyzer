@@ -103,6 +103,8 @@
       padding: 0.85rem 1.15rem;
       border-bottom: 1px solid var(--border);
       display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
       justify-content: space-between;
       align-items: center;
       background: rgba(255, 255, 255, 0.02);
@@ -116,7 +118,7 @@
       gap: 0.5rem;
     }
 
-    .btn-group { display: flex; gap: 0.5rem; }
+    .btn-group { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
     .btn {
       background: #0f172a;
       border: 1px solid var(--border);
@@ -316,7 +318,7 @@
     <div class="card">
       <div class="card-header">
         <div class="card-title">
-          <span>Target Candidate Prioritization</span>
+          <span>Targets</span>
           <span id="candidate-count" style="font-size: 0.78rem; font-weight: 500; color: var(--primary); margin-left: 0.35rem;">(0 Candidates)</span>
         </div>
         <div class="btn-group" style="align-items: center;">
@@ -328,10 +330,15 @@
             <input type="checkbox" id="hide-worked-toggle" checked onchange="toggleHideWorked(this.checked)" style="accent-color: #a855f7; width: 15px; height: 15px; cursor: pointer;">
             <span><b>Hide Worked (B4)</b></span>
           </label>
-          <label style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.82rem; cursor: pointer; color: #34d399; margin-right: 0.5rem; user-select: none;" title="Detects underused FT8 sub-frequencies in the last 60s and sets WSJT-X Rx DF to the clearest open slot (press 'Tx &lt;- Rx' or F11 in WSJT-X to lock Tx)">
-            <input type="checkbox" id="tx-optimize-toggle" onchange="toggleTxOptimize(this.checked)" style="accent-color: #10b981; width: 15px; height: 15px; cursor: pointer;">
-            <span><b>TX Freq Optimize</b></span>
-          </label>
+          <span id="psk-stat-pill" style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; background: #0f172a; border: 1px solid rgba(56, 189, 248, 0.35); padding: 0.22rem 0.55rem; border-radius: 5px; margin-right: 0.5rem; user-select: none;" title="Toggle PSK Reporter ground-truth propagation scoring">
+            <label style="display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; color: #38bdf8; margin: 0;">
+              <input type="checkbox" id="psk-reporter-toggle" checked onchange="togglePskReporter(this.checked)" style="accent-color: #38bdf8; width: 15px; height: 15px; cursor: pointer;">
+              <span><b>📡 PSK:</b></span>
+              <span id="psk-spots-count" style="color: #34d399; font-weight: 600;">--</span>
+              <span id="psk-age-label" style="font-size: 0.72rem; color: var(--text-muted);"></span>
+            </label>
+            <a id="psk-map-link" href="https://pskreporter.info/pskmap.html#preset&callsign=K5JEE&txrx=tx&timerange=3600&hideunrec=1&blankifnone=1&hidelight=1" target="_blank" rel="noopener noreferrer" style="color: #38bdf8; text-decoration: none; margin-left: 0.2rem; font-weight: bold;" title="Open PSK Reporter Map in new tab">↗</a>
+          </span>
           <span id="tx-opt-pill" style="display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.78rem; background: #0f172a; border: 1px solid var(--border); padding: 0.22rem 0.55rem; border-radius: 5px; margin-right: 0.5rem; user-select: none;">
             <span style="color: var(--text-muted);">TX:</span>
             <b id="tx-curr-freq" style="color: #fff;">1500 Hz</b>
@@ -477,6 +484,26 @@
       }).catch(e => console.error(e));
       renderTable(currentDecodes);
       renderRadar(antennaPatternSlice, currentDecodes);
+    }
+
+    // Toggle PSK Reporter Observed Propagation Integration
+    function togglePskReporter(checked) {
+      const tableTog = document.getElementById('psk-reporter-toggle');
+      if (tableTog) tableTog.checked = checked;
+
+      fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ psk_reporter: checked })
+      }).then(r => r.json()).then(res => {
+        if (res.success) {
+          if (checked) {
+            showToast('✓ PSK Reporter enabled (observed propagation scoring)');
+          } else {
+            showToast('PSK Reporter disabled (model-only scoring)');
+          }
+        }
+      }).catch(e => console.error(e));
     }
 
     // Toggle TX Frequency Optimizer
@@ -698,10 +725,6 @@
         // Passband & TX Frequency Optimization
         if (data.passband) {
           const pb = data.passband;
-          const optToggle = document.getElementById('tx-optimize-toggle');
-          if (optToggle && document.activeElement !== optToggle) {
-            optToggle.checked = !!pb.enabled;
-          }
 
           const currFreqEl = document.getElementById('tx-curr-freq');
           if (currFreqEl) currFreqEl.innerText = `${pb.current_tx_df} Hz`;
@@ -726,6 +749,48 @@
 
           const optWidthEl = document.getElementById('tx-opt-width');
           if (optWidthEl) optWidthEl.innerText = `(${pb.clearance_hz || pb.slot_width_hz || 0} Hz clear)`;
+        }
+
+        // PSK Reporter Ground-Truth Status
+        const pskToggle = document.getElementById('psk-reporter-toggle');
+        if (pskToggle && document.activeElement !== pskToggle) {
+          pskToggle.checked = !!data.psk_reporter;
+        }
+
+        const pskSpotsCount = document.getElementById('psk-spots-count');
+        const pskAgeLabel = document.getElementById('psk-age-label');
+        const pskMapLink = document.getElementById('psk-map-link');
+        const pskStats = data.psk_stats || {};
+
+        if (data.psk_reporter) {
+          const count = pskStats.total_spots || 0;
+          const countText = `${count} spot${count === 1 ? '' : 's'}`;
+          const ageText = pskStats.age_str ? `(${pskStats.age_str})` : '';
+
+          if (pskSpotsCount) {
+            pskSpotsCount.innerText = countText;
+            pskSpotsCount.style.color = count > 0 ? '#34d399' : '#fff';
+          }
+          if (pskAgeLabel) pskAgeLabel.innerText = ageText;
+        } else {
+          if (pskSpotsCount) {
+            pskSpotsCount.innerText = 'Off';
+            pskSpotsCount.style.color = 'var(--text-muted)';
+          }
+          if (pskAgeLabel) pskAgeLabel.innerText = '';
+        }
+
+        if (data.de_call && pskMapLink) {
+          let bandParam = '';
+          const activeMhz = data.dial_freq_mhz || 10.136;
+          if (activeMhz >= 7.0 && activeMhz <= 7.3) bandParam = '&band=7000000-7300000';
+          else if (activeMhz >= 10.1 && activeMhz <= 10.15) bandParam = '&band=8000000-12000000';
+          else if (activeMhz >= 14.0 && activeMhz <= 14.35) bandParam = '&band=14000000-14350000';
+          else if (activeMhz >= 18.0 && activeMhz <= 18.2) bandParam = '&band=18000000-18200000';
+          else if (activeMhz >= 21.0 && activeMhz <= 21.45) bandParam = '&band=21000000-21450000';
+          else if (activeMhz >= 28.0 && activeMhz <= 29.7) bandParam = '&band=28000000-29700000';
+          const pskUrl = `https://pskreporter.info/pskmap.html#preset&callsign=${encodeURIComponent(data.de_call)}&txrx=tx${bandParam}&timerange=3600&hideunrec=1&blankifnone=1&hidelight=1`;
+          if (pskMapLink) pskMapLink.href = pskUrl;
         }
 
         // Decodes Table
@@ -766,9 +831,9 @@
       let html = '';
       filtered.forEach((d, idx) => {
         let badgeClass = 'badge-marginal';
-        if (d.rec === 'EXCELLENT') badgeClass = 'badge-excellent';
-        else if (d.rec === 'GOOD') badgeClass = 'badge-good';
-        else if (d.rec === 'WORKED B4') badgeClass = 'badge-marginal';
+        if (d.rec && d.rec.startsWith('EXCELLENT')) badgeClass = 'badge-excellent';
+        else if (d.rec && d.rec.startsWith('GOOD')) badgeClass = 'badge-good';
+        else if (d.rec && d.rec.startsWith('WORKED B4')) badgeClass = 'badge-marginal';
 
         const gainSign = d.gain >= 0 ? '+' : '';
         const snrSign = d.snr >= 0 ? '+' : '';
@@ -803,6 +868,23 @@
           otherBandsBadge = `<span style="background: rgba(168, 85, 247, 0.25); color: #d8b4fe; border: 1px solid rgba(168, 85, 247, 0.45); padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="${tooltip}">+${otherCount}</span>`;
         }
 
+        let pskBadge = '';
+        if (d.psk_info && d.psk_info.match === 'direct_band') {
+          const pskSign = d.psk_info.snr >= 0 ? '+' : '';
+          pskBadge = `<span style="background: rgba(16, 185, 129, 0.22); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.45); padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem;" title="Two-way verified on ${d.psk_info.band || 'current band'}: station heard you at ${pskSign}${d.psk_info.snr} dB (${d.psk_info.age_min}m ago)">2-WAY ${pskSign}${d.psk_info.snr}dB</span>`;
+        } else if (d.psk_info && d.psk_info.match === 'direct_other') {
+          const pskSign = d.psk_info.snr >= 0 ? '+' : '';
+          pskBadge = `<span style="background: rgba(56, 189, 248, 0.18); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); padding: 0.12rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 600; margin-left: 0.35rem;" title="Station heard you on ${d.psk_info.band} at ${pskSign}${d.psk_info.snr} dB (${d.psk_info.age_min}m ago)">HEARD (${d.psk_info.band})</span>`;
+        }
+
+        let pskGridIcon = '';
+        if (d.psk_info && d.psk_info.match === 'grid4') {
+          const avgSign = d.psk_info.avg_snr >= 0 ? '+' : '';
+          pskGridIcon = `<span style="font-size: 0.72rem; color: #34d399; margin-left: 0.25rem; cursor: default;" title="Observed path: ${d.psk_info.spots} station(s) in ${d.psk_info.grid} heard you on this band (avg ${avgSign}${d.psk_info.avg_snr} dB)">⚡</span>`;
+        } else if (d.psk_info && d.psk_info.match === 'grid2') {
+          pskGridIcon = `<span style="font-size: 0.72rem; color: #38bdf8; margin-left: 0.25rem; cursor: default;" title="Regional path: ${d.psk_info.spots} station(s) in ${d.psk_info.grid} field heard you on this band">⚡</span>`;
+        }
+
         let timeEmoji = '☀️';
         let timeTitle = 'Day (F2 layer hv ~280 km)';
         if (d.path_state === 'TWILIGHT') {
@@ -821,8 +903,8 @@
                 CALL
               </button>
             </td>
-            <td><span class="callsign">${d.call}</span>${typeBadge}${workedBadge}${otherBandsBadge}</td>
-            <td><span class="grid">${d.grid}</span></td>
+            <td><span class="callsign">${d.call}</span>${typeBadge}${workedBadge}${otherBandsBadge}${pskBadge}</td>
+            <td><span class="grid">${d.grid}</span>${pskGridIcon}</td>
             <td>
               <span class="badge ${d.is_dx ? 'badge-dx' : 'badge-state'}" title="${d.loc_full || d.country || ''}">
                 ${d.loc_code || '--'}
