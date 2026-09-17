@@ -17,3 +17,6 @@ __pycache__/
 # Secondary markdown files (keep only primary README.md)
 *.md
 !README.md
+
+# Image captures / temporary screenshots
+*.png

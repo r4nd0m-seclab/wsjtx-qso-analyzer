@@ -21,6 +21,31 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from typing import Dict, Tuple, List, Optional, Any
 
+# Prevent BrokenPipeError / IOError when running detached or terminal is closed
+class SafeStream:
+    def __init__(self, stream):
+        self._stream = stream
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except (BrokenPipeError, IOError, OSError):
+            return len(data)
+    def flush(self):
+        try:
+            return self._stream.flush()
+        except (BrokenPipeError, IOError, OSError):
+            pass
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+sys.stdout = SafeStream(sys.stdout)
+sys.stderr = SafeStream(sys.stderr)
+
 # -----------------------------------------------------------------------------
 # Configuration Defaults
 # -----------------------------------------------------------------------------
@@ -389,14 +414,39 @@ class LocationResolver:
 
     def resolve(self, call: str, grid: str) -> Dict[str, Any]:
         call_clean = call.strip().upper()
-        base_call = call_clean.split('/')[0] if '/' in call_clean else call_clean
+        # Handle portable strokes e.g. W4/G3XYZ or G3XYZ/W4 or K5JEE/P
+        parts = call_clean.split('/') if '/' in call_clean else [call_clean]
+        base_call = parts[0]
+        portable_pfx = None
+        if len(parts) > 1:
+            if len(parts[0]) <= 3 and any(c.isdigit() for c in parts[0]):
+                portable_pfx = parts[0]
+                base_call = parts[1]
+            elif len(parts[1]) <= 3 and any(c.isdigit() for c in parts[1]):
+                portable_pfx = parts[1]
+                base_call = parts[0]
+
         grid_4 = grid.strip().upper()[:4] if grid else ''
 
         # 1. Look up DXCC entity from exact or prefix
-        ent = self.exact_map.get(call_clean) or self.exact_map.get(base_call)
+        ent = None
+        if portable_pfx:
+            ent = self.exact_map.get(portable_pfx) or self.prefix_map.get(portable_pfx)
+
         if not ent:
-            for length in range(len(base_call), 0, -1):
-                p = base_call[:length]
+            ent = self.exact_map.get(call_clean) or self.exact_map.get(base_call)
+
+        if not ent:
+            lookup_call = portable_pfx if portable_pfx else base_call
+            for length in range(len(lookup_call), 0, -1):
+                p = lookup_call[:length]
+                # Special ARRL / FCC rule for KG4:
+                # Under FCC rules, KG4 with a 1-letter or 3-letter suffix is a mainland US station (4th district).
+                # Only KG4 with exactly a 2-letter suffix (KG4xx) is Guantanamo Bay.
+                if p == "KG4":
+                    suf = lookup_call[3:]
+                    if len(suf) in (1, 3) and suf.isalpha():
+                        continue
                 if p in self.prefix_map:
                     ent = self.prefix_map[p]
                     break
@@ -414,7 +464,15 @@ class LocationResolver:
             g_country = grid_info.get('country', '')
             g_state = grid_info.get('state', '')
             g_name = grid_info.get('name', '')
-            if country_code in ('US', 'CA') or not country_code:
+            # Grid squares in grids_na.json represent physical operating QTHs in US/Canada.
+            # Override country/state if:
+            # - Station was mapped to US or Canada
+            # - Station has a US callsign or territory callsign (starts with K, W, N, AA-AL, including KG4, KP4, KH6, etc.)
+            # - Station has a Canadian callsign (starts with VE, VA, VO, VY)
+            # - Or country was undetermined
+            is_us_call = re.match(r'^(K|W|N|A[A-L])[0-9A-Z]', base_call) is not None
+            is_ca_call = re.match(r'^(VE|VA|VO|VY)[0-9A-Z]', base_call) is not None
+            if country_code in ('US', 'CA', 'PR', 'VI', 'GU', 'MP', 'KG') or not country_code or is_us_call or is_ca_call:
                 country_code = g_country
                 country_name = 'United States' if g_country == 'US' else 'Canada'
                 state_code = g_state
@@ -860,11 +918,11 @@ def build_wsjt_configure_packet(target_id: str, rx_df: int) -> bytes:
     return pkt
 
 def send_wsjt_configure_rx_df(rx_df: int) -> bool:
-    with state.lock:
-        target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
-        client_id = state.wsjt_client_id or "WSJT-X"
-    pkt = build_wsjt_configure_packet(client_id, rx_df)
     try:
+        with state.lock:
+            target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
+            client_id = state.wsjt_client_id or "WSJT-X"
+        pkt = build_wsjt_configure_packet(client_id, rx_df)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(pkt, target_addr)
         if target_addr != ("127.0.0.1", 2237):
@@ -926,10 +984,13 @@ def analyze_passband(current_tx_df: int, min_hz: int = 400, max_hz: int = 2400, 
     if tx_optimize_enabled and target_addr:
         should_send = (not current_tx_clear or abs(optimal_df - last_opt) >= 50)
         if should_send and (now - last_send > 6.0):
-            send_wsjt_configure_rx_df(optimal_df)
-            with state.lock:
-                state.last_optimized_rx_df = optimal_df
-                state.last_tx_optimize_send_time = now
+            try:
+                send_wsjt_configure_rx_df(optimal_df)
+                with state.lock:
+                    state.last_optimized_rx_df = optimal_df
+                    state.last_tx_optimize_send_time = now
+            except Exception:
+                pass
 
     return {
         "enabled": tx_optimize_enabled,
@@ -1162,106 +1223,129 @@ def space_weather_poller():
 # -----------------------------------------------------------------------------
 class DashboardHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Suppress noisy HTTP GET logging to console
-        pass
+        # Suppress noisy HTTP 200/304 GET logging to console
+        if args and len(args) > 1 and str(args[1]) in ("200", "304"):
+            return
+        try:
+            super().log_message(format, *args)
+        except (BrokenPipeError, IOError, OSError):
+            pass
+
+    def _send_json(self, status: int, data: Any):
+        body = json.dumps(data).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, IOError, OSError):
+            pass
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            with open("index.html", "rb") as f:
-                self.wfile.write(f.read())
+            try:
+                with open("index.html", "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            except Exception as e:
+                self.send_error(500, str(e))
             return
 
         elif self.path == "/favicon.ico":
             svg = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M16 8v20M10 28l6-12 6 12M12 24h8" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="16" cy="8" r="2.5" fill="#38bdf8"/><path d="M11 5a7 7 0 0 0 0 6M21 5a7 7 0 0 1 0 6" stroke="#34d399" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M7 2a13 13 0 0 0 0 12M25 2a13 13 0 0 1 0 12" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" fill="none"/></svg>"""
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
             self.end_headers()
             self.wfile.write(svg)
             return
             
         elif self.path == "/api/state":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            
-            with state.lock:
-                # Disconnect watchdog if no packets for 15s
-                is_connected = (time.time() - state.last_heartbeat_time < 20.0) if state.last_heartbeat_time > 0 else False
-                
-                # Prune decodes older than 6 minutes (24 FT8 cycles)
-                now = time.time()
-                pruned = {k: v for k, v in state.decodes.items() if now - v["timestamp"] < 360}
-                state.decodes = pruned
-                
-                # Filter candidate list against directed CQ restrictions with current station profile
-                ranked_list = []
-                for d in state.decodes.values():
-                    if d.get("is_cq") and d.get("cq_target"):
-                        eligible, _ = is_directed_cq_eligible(
-                            d["cq_target"], d["call"], d["grid"],
-                            state.de_call, state.de_grid, state.loc_resolver
-                        )
-                        if not eligible:
-                            continue
-                    ranked_list.append(d)
-                ranked_list.sort(key=lambda x: x["score"], reverse=True)
-                
-                active_pat = state.pattern_manager.active_pattern if state.pattern_manager else None
-                pattern_slice = active_pat.get_azimuth_slice(15.0) if active_pat else []
-                peak_gain = active_pat.max_gain if active_pat else 0.0
-                pattern_file = state.pattern_manager.active_filename if state.pattern_manager else "None"
-                band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
-                nominal_mhz = state.pattern_manager.active_freq_mhz if state.pattern_manager else 0.0
+            try:
+                with state.lock:
+                    # Disconnect watchdog if no packets for 15s
+                    is_connected = (time.time() - state.last_heartbeat_time < 20.0) if state.last_heartbeat_time > 0 else False
+                    
+                    # Prune decodes older than 6 minutes (24 FT8 cycles)
+                    now = time.time()
+                    pruned = {k: v for k, v in state.decodes.items() if now - v["timestamp"] < 360}
+                    state.decodes = pruned
+                    
+                    # Filter candidate list against directed CQ restrictions with current station profile
+                    ranked_list = []
+                    for d in state.decodes.values():
+                        if d.get("is_cq") and d.get("cq_target"):
+                            eligible, _ = is_directed_cq_eligible(
+                                d["cq_target"], d["call"], d["grid"],
+                                state.de_call, state.de_grid, state.loc_resolver
+                            )
+                            if not eligible:
+                                continue
+                        ranked_list.append(d)
+                    ranked_list.sort(key=lambda x: x["score"], reverse=True)
+                    
+                    active_pat = state.pattern_manager.active_pattern if state.pattern_manager else None
+                    pattern_slice = active_pat.get_azimuth_slice(15.0) if active_pat else []
+                    peak_gain = active_pat.max_gain if active_pat else 0.0
+                    pattern_file = state.pattern_manager.active_filename if state.pattern_manager else "None"
+                    band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
+                    nominal_mhz = state.pattern_manager.active_freq_mhz if state.pattern_manager else 0.0
 
-                freq_mhz = round(state.dial_freq_hz / 1e6, 3)
-                current_band = band_name or get_band_name(freq_mhz)
-                solar_group = get_solar_band_group(freq_mhz)
-                solar_bands = state.solar.get("bands", {}) if state.solar else {}
-                band_cond = solar_bands.get(solar_group, {"day": "--", "night": "--"})
+                    freq_mhz = round(state.dial_freq_hz / 1e6, 3)
+                    current_band = band_name or get_band_name(freq_mhz)
+                    solar_group = get_solar_band_group(freq_mhz)
+                    solar_bands = state.solar.get("bands", {}) if state.solar else {}
+                    band_cond = solar_bands.get(solar_group, {"day": "--", "night": "--"})
 
-                solar_payload = dict(state.solar) if state.solar else {}
-                solar_payload["active_band"] = current_band
-                solar_payload["active_group"] = solar_group
-                solar_payload["active_condition"] = band_cond
+                    solar_payload = dict(state.solar) if state.solar else {}
+                    solar_payload["active_band"] = current_band
+                    solar_payload["active_group"] = solar_group
+                    solar_payload["active_condition"] = band_cond
 
-                passband_info = analyze_passband(state.tx_df)
+                    passband_info = analyze_passband(state.tx_df)
 
-                payload = {
-                    "connected": is_connected,
-                    "dial_freq_hz": state.dial_freq_hz,
-                    "dial_freq_mhz": freq_mhz,
-                    "mode": state.mode,
-                    "de_call": state.de_call,
-                    "de_grid": state.de_grid,
-                    "dx_call": state.dx_call,
-                    "dx_grid": state.dx_grid,
-                    "tx_enabled": state.tx_enabled,
-                    "transmitting": state.transmitting,
-                    "decoding": state.decoding,
-                    "rx_df": state.rx_df,
-                    "tx_df": state.tx_df,
-                    "tx_freq_optimize": state.tx_freq_optimize,
-                    "passband": passband_info,
-                    "solar": solar_payload,
-                    "pattern": {
-                        "filename": pattern_file,
-                        "band": current_band,
-                        "nominal_mhz": nominal_mhz,
-                        "peak_gain": round(peak_gain, 2),
-                        "offset_deg": NORTH_OFFSET_DEG,
-                        "slice_15deg": pattern_slice
-                    },
-                    "cq_only": state.cq_only,
-                    "hide_worked": state.hide_worked,
-                    "worked_total": len(state.log_watcher.worked_any) if state.log_watcher else 0,
-                    "decodes": ranked_list,
-                    "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                }
-            self.wfile.write(json.dumps(payload).encode("utf-8"))
+                    payload = {
+                        "connected": is_connected,
+                        "dial_freq_hz": state.dial_freq_hz,
+                        "dial_freq_mhz": freq_mhz,
+                        "mode": state.mode,
+                        "de_call": state.de_call,
+                        "de_grid": state.de_grid,
+                        "dx_call": state.dx_call,
+                        "dx_grid": state.dx_grid,
+                        "tx_enabled": state.tx_enabled,
+                        "transmitting": state.transmitting,
+                        "decoding": state.decoding,
+                        "rx_df": state.rx_df,
+                        "tx_df": state.tx_df,
+                        "tx_freq_optimize": state.tx_freq_optimize,
+                        "passband": passband_info,
+                        "solar": solar_payload,
+                        "pattern": {
+                            "filename": pattern_file,
+                            "band": current_band,
+                            "nominal_mhz": nominal_mhz,
+                            "peak_gain": round(peak_gain, 2),
+                            "offset_deg": NORTH_OFFSET_DEG,
+                            "slice_15deg": pattern_slice
+                        },
+                        "cq_only": state.cq_only,
+                        "hide_worked": state.hide_worked,
+                        "worked_total": len(state.log_watcher.worked_any) if state.log_watcher else 0,
+                        "decodes": ranked_list,
+                        "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    }
+                self._send_json(200, payload)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
             return
 
         super().do_GET()
@@ -1290,12 +1374,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             state.de_call, state.de_grid, state.loc_resolver
                         )
                         if not ok:
-                            self.send_response(400)
-                            self.send_header("Content-Type", "application/json")
-                            self.end_headers()
-                            self.wfile.write(json.dumps({
+                            self._send_json(400, {
                                 "error": f"Returning call restricted: directed to '{cq_target}' ({reason})"
-                            }).encode("utf-8"))
+                            })
                             return
                 
                 with state.lock:
@@ -1322,15 +1403,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 sock.close()
                 print(f"[Reply] Sent Type 4 Reply for '{msg}' (ID: {client_id}) to {target_addr} and 127.0.0.1:2237")
                 
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"success": True, "call": call}).encode("utf-8"))
+                self._send_json(200, {"success": True, "call": call})
                 return
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                self._send_json(500, {"error": str(e)})
                 return
 
         elif self.path == "/api/simulate":
@@ -1351,20 +1427,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             ]
             for t, snr, dt, df, m, msg in simulated:
                 process_decode(t, snr, dt, df, m, msg)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True, "count": len(simulated)}).encode("utf-8"))
+            self._send_json(200, {"success": True, "count": len(simulated)})
             return
 
         elif self.path == "/api/clear":
             with state.lock:
                 state.decodes.clear()
                 state.passband_decodes.clear()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            self._send_json(200, {"success": True})
             return
 
         elif self.path == "/api/tx-optimize/apply":
@@ -1375,16 +1445,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     opt = analyze_passband(state.tx_df)
                     target_df = opt["optimal_df"]
                 success = send_wsjt_configure_rx_df(target_df)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"success": success, "applied_df": target_df}).encode("utf-8"))
+                self._send_json(200, {"success": success, "applied_df": target_df})
                 return
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                self._send_json(500, {"error": str(e)})
                 return
 
         elif self.path == "/api/settings":
@@ -1402,20 +1466,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             send_wsjt_configure_rx_df(opt["optimal_df"])
                             state.last_optimized_rx_df = opt["optimal_df"]
                             state.last_tx_optimize_send_time = time.time()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({
+                self._send_json(200, {
                     "success": True,
                     "cq_only": state.cq_only,
                     "hide_worked": state.hide_worked,
                     "tx_freq_optimize": state.tx_freq_optimize
-                }).encode("utf-8"))
+                })
                 return
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                self._send_json(500, {"error": str(e)})
                 return
 
         self.send_response(404)
