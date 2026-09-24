@@ -869,7 +869,12 @@ class PskReporterManager:
         if not target_call:
             return False
             
-        url = f"https://retrieve.pskreporter.info/query?senderCallsign={target_call}&flowStartSeconds=-3600&rronly=1"
+        url = (
+            f"https://pskreporter.info/cgi-bin/pskquery5.pl"
+            f"?callback=doNothing&mc_version=2026.08.18.2215&pskvers=2026.06.27.1733"
+            f"&statistics=1&noactive=1&nolocator=1"
+            f"&flowStartSeconds=-3600&senderCallsign={target_call}"
+        )
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "WSJTX-QSO-Companion/1.0 (Amateur Radio QSO Success Estimator)"}
@@ -877,7 +882,7 @@ class PskReporterManager:
         
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
-                xml_data = resp.read()
+                raw = resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             with self.lock:
                 self.last_poll_status = "error"
@@ -886,15 +891,21 @@ class PskReporterManager:
             return False
 
         try:
-            root = ET.fromstring(xml_data)
+            # Strip JSONP wrapper: doNothing({...})
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start == -1 or end == 0:
+                raise ValueError("No JSON object found in response")
+            data = json.loads(raw[start:end])
         except Exception as e:
             with self.lock:
                 self.last_poll_status = "parse_error"
                 self.last_poll_error = str(e)
-            print(f"[PSKReporter] XML parse error: {e}")
+            print(f"[PSKReporter] JSON parse error: {e}")
             return False
 
-        reports = root.findall(".//receptionReport")
+        # Extract reception reports
+        reports_raw = data.get("receptionReport") or []
         now = time.time()
         
         new_by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -903,21 +914,21 @@ class PskReporterManager:
         grid2_acc: Dict[Tuple[str, str], List[int]] = {}
         new_band_counts: Dict[str, int] = {}
 
-        for r in reports:
-            rcall = r.attrib.get("receiverCallsign", "").strip().upper()
+        for r in reports_raw:
+            rcall = str(r.get("receiverCallsign") or r.get("callsign", "")).strip().upper()
             if not rcall:
                 continue
-            rgrid = r.attrib.get("receiverLocator", "").strip().upper()
+            rgrid = str(r.get("receiverLocator") or r.get("locator", "")).strip().upper()
             try:
-                freq_hz = float(r.attrib.get("frequency", 0))
+                freq_hz = float(r.get("frequency", 0))
             except (ValueError, TypeError):
                 freq_hz = 0.0
             try:
-                snr = int(r.attrib.get("sNR", -99))
+                snr = int(r.get("sNR", r.get("snr", -99)))
             except (ValueError, TypeError):
                 snr = -99
             try:
-                flow_sec = int(r.attrib.get("flowStartSeconds", 0))
+                flow_sec = int(r.get("flowStartSeconds", r.get("flow_start", 0)))
             except (ValueError, TypeError):
                 flow_sec = int(now)
 
@@ -972,7 +983,7 @@ class PskReporterManager:
 
         with self.lock:
             self.callsign = target_call
-            self.total_spots = len(reports)
+            self.total_spots = len(reports_raw)
             self.last_poll_time = now
             self.last_poll_status = "ok"
             self.last_poll_error = ""
@@ -983,7 +994,7 @@ class PskReporterManager:
             self.by_band_grid2 = new_grid2
             self.band_counts = new_band_counts
 
-        print(f"[PSKReporter] Updated for {target_call}: {len(reports)} spots across {len(new_band_counts)} bands ({dict(new_band_counts)})")
+        print(f"[PSKReporter] Updated for {target_call}: {len(reports_raw)} spots across {len(new_band_counts)} bands ({dict(new_band_counts)})")
         return True
 
     def lookup(self, call: str, grid: str, current_band: str) -> Dict[str, Any]:
