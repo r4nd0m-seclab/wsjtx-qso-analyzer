@@ -1306,6 +1306,18 @@ def calculate_decode_score(
     
     v_dbi, h_dbi, tot_dbi = pattern.get_gain(az_deg, el_deg) if pattern else (0.0, 0.0, 0.0)
     
+    # Directional penalty: how far below peak gain is this direction?
+    # Targets significantly off the main lobe are penalized even with decent SNR,
+    # as antenna gain is a stronger QSO success predictor than momentary SNR.
+    delta_from_peak_dbi = 0.0
+    directional_penalty = 1.0
+    if pattern:
+        peak_gain = pattern.max_gain
+        delta_from_peak_dbi = round(peak_gain - tot_dbi, 2)
+        # Penalty kicks in at 4 dB below peak, scales linearly to 50% at 18 dB
+        if delta_from_peak_dbi > 4.0:
+            directional_penalty = max(0.5, 1.0 - (delta_from_peak_dbi - 4.0) * 0.035)
+    
     # Resolve Country & State
     loc = loc_resolver.resolve(call, grid) if loc_resolver else {
         "country": "Unknown", "country_code": "", "state": "", "state_code": "",
@@ -1323,7 +1335,7 @@ def calculate_decode_score(
         geomag_loss_db = (kp - 2.0) * (rem_lat - 45.0) * 0.15
         
     rx_margin = snr - (-21.0)
-    base_margin = rx_margin + tot_dbi - geomag_loss_db
+    base_margin = rx_margin + (tot_dbi * 2) - geomag_loss_db
     
     psk_info: Dict[str, Any] = {"match": "disabled"}
     psk_status = ""
@@ -1372,12 +1384,16 @@ def calculate_decode_score(
     else:
         rec = ("EXCELLENT" if score >= 80 else ("GOOD" if score >= 60 else "MARGINAL")) + rec_tag
 
+    # Apply directional penalty AFTER score computed — demotes targets in antenna nulls
+    score = score * directional_penalty
+
     return {
         "dist_km": round(dist_km),
         "dist_mi": round(dist_km * 0.621371),
         "az": round(az_deg, 1),
         "el": round(el_deg, 1),
         "gain": round(tot_dbi, 2),
+        "delta_from_peak_dbi": delta_from_peak_dbi,
         "rx_margin": round(rx_margin, 1),
         "path_state": path_state,
         "hv_km": round(hv_km),
