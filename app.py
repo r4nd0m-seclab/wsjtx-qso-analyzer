@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.request
+from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -845,6 +846,8 @@ class PskReporterManager:
         self.last_poll_status = "idle"
         self.last_poll_error = ""
         self.lock = threading.RLock()
+        self.next_retry_time = 0.0  # Exponential backoff for 429
+        self.backoff_factor = 60.0  # Start at 60s, double each time
         
         self.total_spots = 0
         self.last_update_utc = ""
@@ -862,7 +865,7 @@ class PskReporterManager:
         self.band_counts: Dict[str, int] = {}
         
     def should_poll(self) -> bool:
-        return (time.time() - self.last_poll_time) >= self.min_interval_s
+        return (time.time() - self.last_poll_time) >= self.min_interval_s and time.time() >= self.next_retry_time
 
     def fetch_reports(self, callsign: Optional[str] = None) -> bool:
         target_call = (callsign or self.callsign).strip().upper()
@@ -870,10 +873,10 @@ class PskReporterManager:
             return False
             
         url = (
-            f"https://pskreporter.info/cgi-bin/pskquery5.pl"
-            f"?callback=doNothing&mc_version=2026.08.18.2215&pskvers=2026.06.27.1733"
-            f"&statistics=1&noactive=1&nolocator=1"
-            f"&flowStartSeconds=-3600&senderCallsign={target_call}"
+            f"https://retrieve.pskreporter.info/query"
+            f"?senderCallsign={target_call}"
+            f"&flowStartSeconds=-3600"
+            f"&statistics=1"
         )
         req = urllib.request.Request(
             url,
@@ -883,6 +886,28 @@ class PskReporterManager:
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
+            # Reset backoff on success
+            self.backoff_factor = 1.0
+            self.next_retry_time = 0.0
+        except HTTPError as he:
+            with self.lock:
+                self.last_poll_status = "error"
+                self.last_poll_error = f"HTTP {he.code}: {he.reason}"
+            if he.code == 429:
+                retry_after = he.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = max(int(retry_after), self.backoff_factor)
+                    except ValueError:
+                        wait = self.backoff_factor
+                else:
+                    wait = self.backoff_factor
+                self.backoff_factor = min(self.backoff_factor * 2, 3600)
+                self.next_retry_time = time.time() + wait
+                print(f"[PSKReporter] Rate limited (429) for {target_call}, backing off {wait}s")
+            else:
+                print(f"[PSKReporter] Query failed for {target_call}: HTTP {he.code}: {he.reason}")
+            return False
         except Exception as e:
             with self.lock:
                 self.last_poll_status = "error"
@@ -891,21 +916,16 @@ class PskReporterManager:
             return False
 
         try:
-            # Strip JSONP wrapper: doNothing({...})
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            if start == -1 or end == 0:
-                raise ValueError("No JSON object found in response")
-            data = json.loads(raw[start:end])
-        except Exception as e:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
             with self.lock:
                 self.last_poll_status = "parse_error"
                 self.last_poll_error = str(e)
-            print(f"[PSKReporter] JSON parse error: {e}")
+            print(f"[PSKReporter] XML parse error: {e}")
             return False
 
-        # Extract reception reports
-        reports_raw = data.get("receptionReport") or []
+        # Extract reception reports from XML
+        reports_raw = list(root.findall("receptionReport"))
         now = time.time()
         
         new_by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -915,20 +935,20 @@ class PskReporterManager:
         new_band_counts: Dict[str, int] = {}
 
         for r in reports_raw:
-            rcall = str(r.get("receiverCallsign") or r.get("callsign", "")).strip().upper()
+            rcall = str(r.get("receiverCallsign", "")).strip().upper()
             if not rcall:
                 continue
-            rgrid = str(r.get("receiverLocator") or r.get("locator", "")).strip().upper()
+            rgrid = str(r.get("receiverLocator", "")).strip().upper()
             try:
-                freq_hz = float(r.get("frequency", 0))
+                freq_hz = float(r.get("frequency", 0) or 0)
             except (ValueError, TypeError):
                 freq_hz = 0.0
             try:
-                snr = int(r.get("sNR", r.get("snr", -99)))
+                snr = int(r.get("sNR", -99) or -99)
             except (ValueError, TypeError):
                 snr = -99
             try:
-                flow_sec = int(r.get("flowStartSeconds", r.get("flow_start", 0)))
+                flow_sec = int(r.get("flowStartSeconds", 0) or 0)
             except (ValueError, TypeError):
                 flow_sec = int(now)
 
@@ -1104,8 +1124,121 @@ class State:
         self.log_watcher: Optional[WsjtxLogWatcher] = None
         self.loc_resolver: LocationResolver = LocationResolver()
         self.psk_manager: Optional[PskReporterManager] = None
+        self.qso_tracker: Optional[QsoTracker] = None
 
 state = State()
+
+class QsoTracker:
+    """Tracks QSO attempts and successful completions for scoring analysis."""
+    def __init__(self, log_path: Optional[str] = None, history_path: Optional[str] = None):
+        self.log_path = log_path or self._detect_log_path()
+        self.history_path = history_path or os.path.join(
+            os.path.dirname(self.log_path) if self.log_path else ".",
+            "qso_history.json"
+        )
+        self.attempts: Dict[str, Dict[str, Any]] = {}  # call -> attempt record
+        self.successes: List[Dict[str, Any]] = []       # completed QSOs with scores
+        self.last_check_mtime = 0.0
+        self._load_history()
+
+    def _detect_log_path(self) -> str:
+        candidates = [
+            os.environ.get("WSJTX_LOG_PATH", ""),
+            "/wsjtx-data/wsjtx.log",
+            os.path.expanduser("~/.local/share/WSJT-X/wsjtx.log"),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
+        return "/wsjtx-data/wsjtx.log"
+
+    def _load_history(self):
+        try:
+            if os.path.exists(self.history_path):
+                with open(self.history_path, "r") as f:
+                    data = json.load(f)
+                    self.successes = data.get("successes", [])
+                    print(f"[QsoTracker] Loaded {len(self.successes)} historical QSOs from {self.history_path}")
+        except Exception as e:
+            print(f"[QsoTracker] Error loading history: {e}")
+
+    def save_history(self):
+        try:
+            with open(self.history_path, "w") as f:
+                json.dump({"successes": self.successes}, f, indent=2)
+        except Exception as e:
+            print(f"[QsoTracker] Error saving history: {e}")
+
+    def record_attempt(self, call: str, score_data: Dict[str, Any], snr: int):
+        """Record a QSO attempt when the user clicks CALL."""
+        self.attempts[call] = {
+            "time": time.time(),
+            "snr": snr,
+            "score": score_data.get("score", 0),
+            "gain": score_data.get("gain", 0),
+            "delta_from_peak_dbi": score_data.get("delta_from_peak_dbi", 0),
+            "rx_margin": score_data.get("rx_margin", 0),
+            "rec": score_data.get("rec", ""),
+            "grid": score_data.get("grid", ""),
+            "dist_km": score_data.get("dist_km", 0),
+            "az": score_data.get("az", 0),
+            "el": score_data.get("el", 0),
+        }
+
+    def check_completions(self, log_watcher: Optional[WsjtxLogWatcher]):
+        """Check wsjtx.log for newly completed QSOs matching our attempts."""
+        if not log_watcher:
+            return
+        log_watcher.reload_if_changed()
+        for call, attempt in list(self.attempts.items()):
+            # Check if this call appeared in the log since our attempt
+            qsos = log_watcher.worked_any.get(call, [])
+            for qso in qsos:
+                qso_date = qso.get("date", "")
+                qso_time_str = qso.get("time", "")
+                if qso_date and qso_time_str:
+                    try:
+                        qso_ts = datetime.strptime(
+                            f"{qso_date} {qso_time_str}", "%Y/%m/%d %H:%M"
+                        ).replace(tzinfo=timezone.utc).timestamp()
+                        # If the QSO happened after our attempt, mark success
+                        if qso_ts >= attempt["time"] - 300:  # within 5 min window
+                            success = {
+                                **attempt,
+                                "completed_at": qso_ts,
+                                "completed_date": qso_date,
+                                "completed_time": qso_time_str,
+                                "band": qso.get("band", ""),
+                                "freq": qso.get("freq", 0),
+                                "mode": qso.get("mode", ""),
+                                "grid": qso.get("grid", attempt.get("grid", "")),
+                            }
+                            # Avoid duplicates
+                            if not any(s.get("completed_at") == qso_ts and s.get("call") == call
+                                      for s in self.successes):
+                                self.successes.append(success)
+                                print(f"[QsoTracker] QSO confirmed: {call} ({qso_date} {qso_time_str})")
+                            # Remove from attempts
+                            del self.attempts[call]
+                            self.save_history()
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return summary stats for tuning weights."""
+        if not self.successes:
+            return {"total": 0}
+        gains = [s["gain"] for s in self.successes if "gain" in s]
+        snrs = [s["snr"] for s in self.successes if "snr" in s]
+        deltas = [s["delta_from_peak_dbi"] for s in self.successes if "delta_from_peak_dbi" in s]
+        return {
+            "total": len(self.successes),
+            "avg_gain": round(sum(gains) / len(gains), 2) if gains else 0,
+            "avg_snr": round(sum(snrs) / len(snrs), 1) if snrs else 0,
+            "avg_delta_from_peak": round(sum(deltas) / len(deltas), 2) if deltas else 0,
+        }
+
 
 # -----------------------------------------------------------------------------
 # WSJT-X UDP Serialization & Listener
@@ -1618,6 +1751,10 @@ def psk_reporter_poller():
             if enabled and mgr and mgr.should_poll():
                 if mgr.fetch_reports(callsign):
                     rescore_all_decodes()
+            
+            # Check for completed QSOs
+            if state.qso_tracker:
+                state.qso_tracker.check_completions(state.log_watcher)
         except Exception as e:
             print(f"[PSKReporter] Poller loop error: {e}")
         time.sleep(10)
@@ -1791,7 +1928,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 with state.lock:
                     target_addr = state.wsjt_remote_addr or ("127.0.0.1", 2237)
                     client_id = state.wsjt_client_id or "WSJT-X"
-
+                
+                    # Record attempt in QSO tracker for later analysis
+                    if state.qso_tracker and call in state.decodes:
+                        decode = state.decodes[call]
+                        if decode.get("scored"):
+                            state.qso_tracker.record_attempt(
+                                call=call,
+                                score_data=decode.get("scored", {}),
+                                snr=int(snr) if snr else 0
+                            )
+                
                 pkt = build_wsjt_reply_packet(
                     target_id=client_id,
                     qtime_ms=qtime_ms,
@@ -1839,6 +1986,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(200, {"success": True, "count": len(simulated)})
             return
 
+        elif self.path == "/api/qso-history":
+            if self.command == "GET":
+                with state.lock:
+                    tracker = state.qso_tracker
+                if tracker:
+                    self._send_json(200, {
+                        "stats": tracker.get_stats(),
+                        "successes": tracker.successes,
+                        "attempts": list(tracker.attempts.values()),
+                    })
+                else:
+                    self._send_json(200, {"stats": {}, "successes": [], "attempts": []})
+                return
+            self._send_json(405, {"error": "Method not allowed"})
+            return
+        
         elif self.path == "/api/clear":
             with state.lock:
                 state.decodes.clear()
@@ -1922,6 +2085,9 @@ def main():
     
     # Initialize PSK Reporter Ground-Truth Manager
     state.psk_manager = PskReporterManager(callsign=state.de_call or DEFAULT_MY_CALL)
+    
+    # Initialize QSO Tracker (records attempts & confirmed completions)
+    state.qso_tracker = QsoTracker()
     
     # Fetch initial solar data
     state.solar = SpaceWeather.fetch()
