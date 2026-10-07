@@ -5,6 +5,8 @@ Listens on WSJT-X UDP port 2237, scores incoming decodes against 3D antenna patt
 and real-time space weather, resolves country and state codes, and provides a web dashboard on port 8080.
 """
 
+import base64
+import cmath
 import csv
 import io
 import json
@@ -17,6 +19,7 @@ import sys
 import threading
 import time
 import urllib.request
+import zlib
 from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -641,6 +644,176 @@ def estimate_elevation(dist_km: float, virtual_height_km: float = 300.0) -> Tupl
 def ft8_decode_probability(snr_db: float, snr_threshold: float = -21.0, slope: float = 0.8) -> float:
     margin = snr_db - snr_threshold
     return 1.0 / (1.0 + math.exp(-slope * margin))
+
+# -----------------------------------------------------------------------------
+# Global Land/Sea Mask & Ground Reflection Physics
+# -----------------------------------------------------------------------------
+LAND_MASK_B85 = "c-rlmy=xsu5WwejFK-Q&bxK@V5LxFgDO|h|h$Sq14-#;hKp?FJY0^cVokq98!AfPNOB2w)5J;0MT4RIKDP>aW2|-8^qO)c23C=g!y^p=wk9*c@QUotZobG-%H#;*sJ39h+J*JEa2Is*<iHT(8uXBtN@iEG=i?3!gRwku_F_M4rs{r?^`-xv!42ueuO7nC@f6zr&^M^0+tYRxI((Y00h+TwhS;DcE4C@2^Y{`b#1wTEDMa2@K6ZKvhSuo$b|I;C>EP|aeCi0G`Y&kJ>nFlE50CEG~ls|ILp(PpN!Hcz<(td^-%ax7raGL=mS{$bPH;UW!v(B&)tW2tD#Jp0Y34{}5cMH7ez+cw(iT}V_bY8tw#91yCQ1Io(q16{rkEjWWBizCG<k5W$WH8lt1u7Xk1jd6TsFlKyJvm^~v#l{QWrXAO7o;NseR;Bd7D=nt%1MjGrz!&JIQ+WM*Fm8i9yIZ~8!G_@TxR<64irmVerlr3fyZfv_89YAPvG&(5Tq7DPL1Q!w6xg-LJdC}NOP5}3GTv?D=o|QHGC)nC~B39q;%msAi9qTY2mz?U+lnZa_UlY(ZX_OqJa}zjZ~-rE8ee79fL^c^}<UwEcmO<D&j&YYV`#+tCR;n#FpU#SgoR9q1Ic?wFx*8j^pPh46vo1i~wpqq7Du=qtY^Qz21i{oQQTsiSWm;v_gn0LA(i5IZoRsT4mQZO)cUseKamVZekf$7joOmZ-7n+nF%i?=)$21%XqxfWGoLn*TTQG_iC^3BL}|JrGnO7?_Gy>omgYuOytThY^#>+M%;kFFY8<E6Z$R<BMLY7zK2eYyHuBC-i6yVm*Y$PyfmHS!1Ef;<yxoicGYOJ+-9+Via>*utvGP|u{`CEv0HFTy{I2fU<b1!BSIaxb$=d@e*T!u?=Xh2AC5+g`$Xg03kF>3J*|cT9uhcQfWU#<zj6k{2L!&cEGS$U@OYBK-~-~4<&46)2^VSSDCLr+lERs>wN5Hq5%`<8jl#qTfK0td;xrb<zRC4|)F{P<25j!#DxeveZj^pQ95^=j<1-6Ru`fX7c!u$CXc+PY5B#A4@LXy<G+eYNchVmCAF0Fwoh`<wv%jszw-UZi?T85`6S{4a@tuS(baj|=QMuPzk6G{{saIM!U2f=ioO&@deUGS0iu&qJ8!ke)YQrdvC=H%2+OUk_4I>0)NtjBQAr76Av0%$QFeE>%DjQa&6bqWAv{LV08a}EjWLa0ZlC#~Ys_Z)WSUO`O)lTLdn4`66;J&o4Twik4jNDo~GS?Vx%hfIml>$95M+@GOH)Nq8FmPe$(nbyM##7+JlDsEFf>*Hc)bW;NWnTr$;>JCVh&JpRYor@hIm+{3>>5u5C!dn2L)@z1@urSlIxe52B=~DRuE6*j3|z@@&?GQUmfl-ZJK!Gp*Cy#wc%*8KF$0fVn&nb<>r|RJgwS&~6K!rR>Y}Gv)JDN?B)ob-)@h~=meEl3!2!tzHM23C1pcF#0oM}{^Lf|<ha?-+FY=3Jxac_%nsBrBI4e(kVAjEHI*epWakb7naTH!C)_CZL13keucit-2;F(vA2H_-ku8Vg+Dw$7m^Knjc=PHaLi@k7TFanPx{3N+_K3MJBPmud`)+ZnhtFxdi_y?{BJur+v8^FHL-R*8)(w*djJapK}L-fIF3_Ky)y09?eVBm}A*2z+Ge64#D58Q0mIoX6oG(QbiSKXBUj+TAx5CTW5ofHq8n{c<kV{%IxkUNI%;4mgOy``Mv7&_80P&n~rnHDak!DI5p^xSY!g-qbWtbLyHh&n5PITsGKFbxY@0lS&8k_-mSJTa<^a|tsVx{(KtG#qOsg|DbmFe9+BD9#JNQgTL=<i0|%>XqqBX2P*2f6W93TF=nCC=4~aNs&-cjl9T}tb<FWM%nVa>%k0fYJkQVgTK&|b6H<!Q%zy+oG>WZ%pJva_<|+5x7+$fwFMaP^k%D>JBsP>l2z&U_k-onMH7yv!Pd^1_e&n@7SlP@Xd0h1i%#uR-<t&<^&UT7J<iuI*G*b`%=N=tv$XBEU<RevXOUdY0%x<Bj=%nI%YQV6GqB@X1TXeI@SUy}Oz+oeWaVDfnRW)Va(j0uOI`t2#}?gsbpmok(^qz?kgm68)0_HZ>#7SZ$E3fDQ#LF1PfcV-=iaxxJv~$kZwz5_oUZ06J@DG2(IeYCy+StV9yqkxyv*O6MN)+qW^)O#9~QKk->*asZyVjuyjO6g<1(kVDFcC1jiD#R3Xwn`9NCj+x&_fEnLa+k{?XG-?-P9(_d3BD>R$yZ{-4Lc9{FTT"
+_LAND_MASK_BYTES: Optional[bytes] = None
+
+def _get_land_mask_bytes() -> bytes:
+    global _LAND_MASK_BYTES
+    if _LAND_MASK_BYTES is None:
+        _LAND_MASK_BYTES = zlib.decompress(base64.b85decode(LAND_MASK_B85))
+    return _LAND_MASK_BYTES
+
+def is_land_coord(lat: float, lon: float) -> bool:
+    """Returns True if (lat, lon) is on land according to the 1-degree resolution mask."""
+    mask = _get_land_mask_bytes()
+    lat_i = int(round(89.5 - max(-89.5, min(89.5, lat))))
+    lon_i = int(round((lon + 180.0) % 360.0 - 0.5)) % 360
+    idx = lat_i * 360 + lon_i
+    byte_idx = idx // 8
+    bit_idx = idx % 8
+    return bool(mask[byte_idx] & (1 << bit_idx))
+
+def classify_ground(lat: float, lon: float) -> Tuple[str, str]:
+    """Classifies Earth surface type at (lat, lon) into (type, label)."""
+    if lat <= -60.0 or lat >= 75.0 or (lat >= 60.0 and -55.0 <= lon <= -20.0):
+        return "ICE", "Polar Ice Sheet"
+    if not is_land_coord(lat, lon):
+        return "SEA", "Sea Water"
+    if 15.0 <= lat <= 32.0 and -15.0 <= lon <= 55.0:
+        return "ARID", "Desert / Dry Sand"
+    if -32.0 <= lat <= -18.0 and 115.0 <= lon <= 142.0:
+        return "ARID", "Arid Scrub / Rock"
+    if 25.0 <= lat <= 42.0 and -118.0 <= lon <= -102.0:
+        return "ARID", "Arid / Desert"
+    return "LAND", "Pastoral / Soil"
+
+def ground_reflection_loss(surface_type: str, elev_deg: float, freq_mhz: float = 14.074) -> float:
+    """Calculates Fresnel reflection loss in dB for mixed polarization at grazing angle elev_deg."""
+    if surface_type == "SEA":
+        sigma = 5.0
+        eps_r = 80.0
+    elif surface_type == "ARID":
+        sigma = 0.001
+        eps_r = 4.0
+    elif surface_type == "ICE":
+        sigma = 0.0001
+        eps_r = 3.0
+    else:  # LAND
+        sigma = 0.005
+        eps_r = 13.0
+
+    psi = math.radians(max(1.0, min(89.0, elev_deg)))
+    f = max(1.0, freq_mhz)
+    eta = eps_r - 1j * (1.8e4 * sigma / f)
+
+    sin_psi = math.sin(psi)
+    cos_psi = math.cos(psi)
+    sq = cmath.sqrt(eta - cos_psi**2)
+
+    r_h = (sin_psi - sq) / (sin_psi + sq)
+    r_v = (eta * sin_psi - sq) / (eta * sin_psi + sq)
+
+    p_eff = (abs(r_h)**2 + abs(r_v)**2) / 2.0
+    p_eff = max(0.001, min(0.999, p_eff))
+    loss_db = -10.0 * math.log10(p_eff)
+    return round(loss_db, 1)
+
+def intermediate_point(lat1: float, lon1: float, lat2: float, lon2: float, f: float) -> Tuple[float, float]:
+    """Calculates intermediate point at fraction f along great circle between two lat/lon coordinates."""
+    if f <= 0.0:
+        return lat1, lon1
+    if f >= 1.0:
+        return lat2, lon2
+    p1, l1 = math.radians(lat1), math.radians(lon1)
+    p2, l2 = math.radians(lat2), math.radians(lon2)
+    d = 2.0 * math.asin(math.sqrt(
+        math.sin((p2 - p1) / 2.0)**2 +
+        math.cos(p1) * math.cos(p2) * math.sin((l2 - l1) / 2.0)**2
+    ))
+    if d == 0.0:
+        return lat1, lon1
+    a = math.sin((1.0 - f) * d) / math.sin(d)
+    b = math.sin(f * d) / math.sin(d)
+    x = a * math.cos(p1) * math.cos(l1) + b * math.cos(p2) * math.cos(l2)
+    y = a * math.cos(p1) * math.sin(l1) + b * math.cos(p2) * math.sin(l2)
+    z = a * math.sin(p1) + b * math.sin(p2)
+    lat_f = math.atan2(z, math.sqrt(x * x + y * y))
+    lon_f = math.atan2(y, x)
+    return math.degrees(lat_f), (math.degrees(lon_f) + 180.0) % 360.0 - 180.0
+
+def latlon_to_maidenhead(lat: float, lon: float, precision: int = 4) -> str:
+    """Converts lat/lon to Maidenhead grid square string."""
+    adj_lon = (lon + 180.0) % 360.0
+    adj_lat = max(-90.0, min(90.0, lat)) + 90.0
+    field_lon = chr(ord('A') + int(adj_lon / 20.0))
+    field_lat = chr(ord('A') + min(17, int(adj_lat / 10.0)))
+    sq_lon = str(int((adj_lon % 20.0) / 2.0))
+    sq_lat = str(int((adj_lat % 10.0) / 1.0))
+    res = f"{field_lon}{field_lat}{sq_lon}{sq_lat}"
+    if precision >= 6:
+        rem_lon = (adj_lon % 20.0) % 2.0
+        rem_lat = (adj_lat % 10.0) % 1.0
+        sub_lon = chr(ord('A') + int(rem_lon / (2.0 / 24.0)))
+        sub_lat = chr(ord('A') + int(rem_lat / (1.0 / 24.0)))
+        res += f"{sub_lon}{sub_lat}"
+    return res
+
+def analyze_ray_path(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+    dist_km: float, freq_mhz: float, dt_utc: datetime
+) -> Dict[str, Any]:
+    """Calculates multi-hop ray path geometry, ionospheric heights, and intermediate ground bounces."""
+    hops = max(1, math.ceil(dist_km / 3000.0))
+    hop_km = round(dist_km / hops)
+
+    iono_hops = []
+    total_hv = 0.0
+    for i in range(1, hops + 1):
+        f_iono = (2 * i - 1) / (2.0 * hops)
+        h_lat, h_lon = intermediate_point(lat1, lon1, lat2, lon2, f_iono)
+        sun_el = solar_elevation(h_lat, h_lon, dt_utc)
+        state = "DAY" if sun_el > 0 else ("TWILIGHT" if sun_el > -12 else "NIGHT")
+        hv = 280.0 if state == "DAY" else (310.0 if state == "TWILIGHT" else 350.0)
+        total_hv += hv
+        iono_hops.append({
+            "hop": i,
+            "lat": round(h_lat, 2),
+            "lon": round(h_lon, 2),
+            "sun_el": round(sun_el, 1),
+            "state": state,
+            "hv_km": round(hv)
+        })
+
+    avg_hv_km = total_hv / hops
+    el_deg, _ = estimate_elevation(dist_km, virtual_height_km=avg_hv_km)
+
+    bounces = []
+    total_ground_loss = 0.0
+    for k in range(1, hops):
+        f_gnd = k / float(hops)
+        b_lat, b_lon = intermediate_point(lat1, lon1, lat2, lon2, f_gnd)
+        g_type, g_label = classify_ground(b_lat, b_lon)
+        loss = ground_reflection_loss(g_type, el_deg, freq_mhz)
+        total_ground_loss += loss
+        bounces.append({
+            "idx": k,
+            "lat": round(b_lat, 2),
+            "lon": round(b_lon, 2),
+            "grid": latlon_to_maidenhead(b_lat, b_lon),
+            "type": g_type,
+            "label": g_label,
+            "loss_db": round(loss, 1)
+        })
+
+    fspl = 0.0
+    if dist_km > 0 and freq_mhz > 0:
+        fspl = 32.44 + 20.0 * math.log10(dist_km) + 20.0 * math.log10(freq_mhz)
+
+    return {
+        "hops": hops,
+        "hop_km": hop_km,
+        "el": round(el_deg, 1),
+        "avg_hv_km": round(avg_hv_km),
+        "iono_hops": iono_hops,
+        "bounces": bounces,
+        "total_ground_loss_db": round(total_ground_loss, 1),
+        "fspl_db": round(fspl, 1)
+    }
+
 
 # -----------------------------------------------------------------------------
 # Directed CQ Target Constants & Matching
@@ -1422,7 +1595,8 @@ def calculate_decode_score(
     log_watcher: Optional[WsjtxLogWatcher],
     loc_resolver: Optional[LocationResolver],
     psk_enabled: bool = False,
-    psk_manager: Optional[PskReporterManager] = None
+    psk_manager: Optional[PskReporterManager] = None,
+    freq_mhz: float = 14.074
 ) -> Optional[Dict[str, Any]]:
     home_lat, home_lon = maidenhead_to_latlon(home_grid)
     rem_lat, rem_lon = maidenhead_to_latlon(grid)
@@ -1434,8 +1608,14 @@ def calculate_decode_score(
     mid_sun_el = solar_elevation(mid_lat, mid_lon, now_utc)
     path_state = "DAY" if mid_sun_el > 0 else ("TWILIGHT" if mid_sun_el > -12 else "NIGHT")
     
-    hv_km = 280.0 if path_state == "DAY" else (310.0 if path_state == "TWILIGHT" else 350.0)
-    el_deg, hops = estimate_elevation(dist_km, virtual_height_km=hv_km)
+    path_analysis = analyze_ray_path(home_lat, home_lon, rem_lat, rem_lon, dist_km, freq_mhz, now_utc)
+    hops = path_analysis["hops"]
+    hop_km = path_analysis["hop_km"]
+    el_deg = path_analysis["el"]
+    hv_km = path_analysis["avg_hv_km"]
+    bounces = path_analysis["bounces"]
+    total_ground_loss_db = path_analysis["total_ground_loss_db"]
+    fspl_db = path_analysis["fspl_db"]
     
     v_dbi, h_dbi, tot_dbi = pattern.get_gain(az_deg, el_deg) if pattern else (0.0, 0.0, 0.0)
     
@@ -1468,7 +1648,7 @@ def calculate_decode_score(
         geomag_loss_db = (kp - 2.0) * (rem_lat - 45.0) * 0.15
         
     rx_margin = snr - (-21.0)
-    base_margin = rx_margin + (tot_dbi * 2) - geomag_loss_db
+    base_margin = rx_margin + (tot_dbi * 2) - geomag_loss_db - (total_ground_loss_db * 0.4)
     
     psk_info: Dict[str, Any] = {"match": "disabled"}
     psk_status = ""
@@ -1525,6 +1705,11 @@ def calculate_decode_score(
         "dist_mi": round(dist_km * 0.621371),
         "az": round(az_deg, 1),
         "el": round(el_deg, 1),
+        "hops": hops,
+        "hop_km": hop_km,
+        "fspl_db": fspl_db,
+        "ground_loss_db": total_ground_loss_db,
+        "bounces": bounces,
         "gain": round(tot_dbi, 2),
         "delta_from_peak_dbi": delta_from_peak_dbi,
         "rx_margin": round(rx_margin, 1),
@@ -1568,7 +1753,7 @@ def rescore_all_decodes():
             calc = calculate_decode_score(
                 d["call"], d["grid"], d["snr"], d.get("is_cq", False), d.get("cq_target"),
                 home_grid, my_call, pattern, current_band, kp, log_watcher, loc_resolver,
-                psk_enabled, psk_manager
+                psk_enabled, psk_manager, freq_mhz=freq_mhz
             )
             if calc:
                 d.update(calc)
@@ -1615,7 +1800,7 @@ def process_decode(qtime_ms: int, snr: int, dt: float, df: int, mode: str, messa
     calc = calculate_decode_score(
         call, grid, snr, is_cq, cq_target,
         home_grid, my_call, pattern, current_band, kp, log_watcher, loc_resolver,
-        psk_enabled, psk_manager
+        psk_enabled, psk_manager, freq_mhz=freq_mhz
     )
     if not calc:
         return
