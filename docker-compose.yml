@@ -10,7 +10,7 @@ services:
       - HTTP_PORT=8080
       - UDP_PORT=2237
       - HOME_GRID=EL09
-      - NORTH_OFFSET_DEG=0.0
+      - NORTH_OFFSET_DEG=151.5
       - PATTERNS_DIR=/app/patterns
     volumes:
       - ./patterns:/app/patterns:ro
