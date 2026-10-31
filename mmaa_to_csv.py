@@ -26,9 +26,62 @@ matching MMANA's behavior.
 """
 import argparse, json, math, os, re, subprocess, sys, tempfile
 
-NEC_DEFAULT = os.environ.get("NEC2PP", "/home/r4nd0m/.hermes/cache/scratch/necpp/build/src/nec2++")
+NEC_DEFAULT = os.environ.get("NEC2PP") or __import__("shutil").which("nec2++") or "nec2++"
 CALIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gnd_calibration.json")
-DEFAULT_EPS, DEFAULT_SIGMA = 13.0, 0.005   # "dry field/forest" per MMANA manual
+# User's MMANA Ground panel: Dielec 13, Conduct 2.0 mS/m (0.002 S/m), Real selected
+DEFAULT_EPS, DEFAULT_SIGMA = 13.0, 0.002
+
+
+# ---------------------------------------------------------------- stub-free
+def apply_stub_free(wires, src):
+    """Remove the short vertical drop-wire stub and reconnect the
+    counterpoise directly at the feedpoint.
+
+    Why: a 6-in drop wire is ~lambda/140-190 on 20-30 m — 1-2 MoM segments
+    with the source on it, a near-singular stub that diverges MMANA (21.65 dBi
+    spike at 10.136 MHz) and mis-points the NEC lobe. The stub is <1% of a
+    wavelength, so reconnecting the CP at the feedpoint is the same antenna
+    electrically.
+
+    Generic for this family: the drop wire = the shortest non-source wire that
+    shares the source point; any wire touching the stub's far end is rewired
+    to the source point; the source moves to the first segment of the longest
+    remaining wire at that point.
+    """
+    def pt(w, pos):
+        return (w[0], w[1], w[2]) if pos == "b" else (w[3], w[4], w[5])
+
+    src_point = pt(wires[src[0]], src[1])
+    L = [math.hypot(w[3]-w[0], w[4]-w[1], w[5]-w[2]) for w in wires]
+    cands = [i for i in range(len(wires))
+             if i != src[0]
+             and (((wires[i][0], wires[i][1], wires[i][2]) == src_point)
+                  or ((wires[i][3], wires[i][4], wires[i][5]) == src_point))]
+    if not cands:
+        raise SystemExit("stub-free: no drop wire found at the source point")
+    drop = min(cands, key=lambda i: L[i])
+    dw = wires[drop]
+    far = (dw[0], dw[1], dw[2]) if (dw[3], dw[4], dw[5]) == src_point else (dw[3], dw[4], dw[5])
+
+    out = []
+    for i, w in enumerate(wires):
+        if i == drop:
+            continue
+        x1, y1, z1, x2, y2, z2, r = w
+        if (x1, y1, z1) == far:
+            x1, y1, z1 = src_point
+        if (x2, y2, z2) == far:
+            x2, y2, z2 = src_point
+        out.append((x1, y1, z1, x2, y2, z2, r))
+
+    # new source: first segment of the longest remaining wire at the source point
+    best, best_len = 0, -1
+    for i, w in enumerate(out):
+        if (w[0], w[1], w[2]) == src_point or (w[3], w[4], w[5]) == src_point:
+            if L[i] > best_len:
+                best, best_len = i, L[i]
+    pos = "b" if (out[best][0], out[best][1], out[best][2]) == src_point else "e"
+    return out, (best, pos)
 
 
 # ---------------------------------------------------------------- .maa parse
@@ -128,10 +181,11 @@ def az_map(nez_phi, rot, mirror):
     return (a + rot) % 360
 
 
-def write_csv(grid, path, rot, mirror):
+def write_csv(grid, path, rot, mirror, shift=0.0):
+    rot = int(rot) if rot is not None else 0
     with open(path, "w") as f:
         f.write("ZENITH(DEG),AZIMUTH(DEG),VERT(dBi),HORI(dBi),TOTAL(dBi)\n")
-        for el in range(90, 0, -1):      # elevation 90..1  ==  zenith 0..89 (MMANA grid)
+        for el in range(89, -1, -1):     # elevation 89..0 == zenith 0..89 (MMANA grid)
             for az in range(0, 360):
                 # invert az_map: find phi such that az_map(phi)==az
                 if mirror:
@@ -139,7 +193,7 @@ def write_csv(grid, path, rot, mirror):
                 else:
                     phi = (az - rot) % 360
                 v, h, t = grid.get((el, phi), (-999.0, -999.0, -999.0))
-                f.write(f"{90 - el}.{0},{az}.{0},{v:.2f},{h:.2f},{t:.2f}\n")
+                f.write(f"{90 - el}.0,{az}.0,{v + shift:.2f},{h + shift:.2f},{t + shift:.2f}\n")
 
 
 # ---------------------------------------------------------------- validate
@@ -201,6 +255,13 @@ def main():
     ap.add_argument("--fit-gnd", action="store_true",
                     help="calibrate eps/sigma+rot against one or more --validate refs")
     ap.add_argument("--calib", default=CALIB)
+    ap.add_argument("--stub-free", action="store_true",
+                    help="remove the drop-wire stub, reconnect CP at the feedpoint "
+                         "(fixes the near-singular MoM stub that diverges MMANA at 30 m)")
+    ap.add_argument("--peak-anchor", type=float, default=None,
+                    help="level-calibrate: shift all gains so the pattern peak equals "
+                         "this value (dBi). Use the neighboring-bands peak trend "
+                         "(e.g. log-freq interpolation between 40 m and 20 m).")
     args = ap.parse_args()
 
     if args.eps is None or args.sigma is None:
@@ -217,6 +278,10 @@ def main():
 
     wires, src, ghm = parse_maa(args.maa)
     print(f"[parse] {len(wires)} wires, source w{src[0]+1}{src[1]}, G/H/M/R line = {ghm}")
+    if args.stub_free:
+        wires, src = apply_stub_free(wires, src)
+        print(f"[stub-free] {len(wires)} wires (drop wire removed, CP reconnected at "
+              f"feedpoint), source now w{src[0]+1}{src[1]}")
     with tempfile.TemporaryDirectory() as tmp:
         nepath = build_nec(wires, src, args.freq, args.eps, args.sigma, tmp)
         print(f"[nec] eps={args.eps} sigma={args.sigma} S/m freq={args.freq} MHz")
@@ -236,7 +301,14 @@ def main():
             json.dump(cal, open(args.calib, "w"), indent=2)
             print(f"[fit] saved {args.calib}")
         if args.out:
-            write_csv(g_nec, args.out, args.rot, args.mirror)
+            shift = 0.0
+            if args.peak_anchor is not None:
+                peak = max(t for (v, h, t) in g_nec.values() if t > -900)
+                shift = args.peak_anchor - peak
+                print(f"[anchor] raw peak {peak:.2f} dBi -> +{shift:.2f} dB "
+                      f"level shift to reach {args.peak_anchor:.2f} dBi")
+            write_csv(g_nec, args.out, args.rot if args.rot is not None else 0,
+                      bool(args.mirror), shift=shift)
             print(f"[out] wrote {args.out}")
 
 
