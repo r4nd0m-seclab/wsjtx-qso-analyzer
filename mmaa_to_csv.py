@@ -150,8 +150,13 @@ def build_nec(wires, src, freq, eps, sigma, tmp):
 
 def run_nec(nec_bin, nepath, tmp, timeout=900):
     out = os.path.join(tmp, "out.txt")
+    env = os.environ.copy()
+    bin_dir = os.path.dirname(os.path.abspath(nec_bin))
+    env["LD_LIBRARY_PATH"] = f"{bin_dir}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":")
     p = subprocess.run([nec_bin, "-i", nepath, "-s", "-o", out],
-                       capture_output=True, text=True, timeout=timeout)
+                       capture_output=True, text=True, timeout=timeout, env=env)
+    if p.returncode != 0:
+        raise SystemExit(f"NEC2++ failed (exit {p.returncode}):\n{p.stderr or p.stdout}")
     if "Runtime Error" in p.stdout:
         raise SystemExit(f"NEC2++ runtime error:\n{p.stdout.strip().splitlines()[-3:]}")
     txt = open(out).read()
@@ -185,7 +190,7 @@ def write_csv(grid, path, rot, mirror, shift=0.0):
     rot = int(rot) if rot is not None else 0
     with open(path, "w") as f:
         f.write("ZENITH(DEG),AZIMUTH(DEG),VERT(dBi),HORI(dBi),TOTAL(dBi)\n")
-        for el in range(89, -1, -1):     # elevation 89..0 == zenith 0..89 (MMANA grid)
+        for el in range(90, 0, -1):     # elevation 90..1 == zenith 0..89 (MMANA grid)
             for az in range(0, 360):
                 # invert az_map: find phi such that az_map(phi)==az
                 if mirror:
@@ -240,12 +245,31 @@ def auto_calibrate(g_nec, g_mm):
     return best
 
 
+STANDARD_BANDS = [1.840, 3.573, 5.357, 7.074, 10.136, 14.074, 18.100, 21.074, 24.915, 28.074]
+
+
+def solve_frequency(wires, src, freq, nec_bin, eps, sigma, rot, mirror, out_path=None, peak_anchor=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        nepath = build_nec(wires, src, freq, eps, sigma, tmp)
+        g_nec = run_nec(nec_bin, nepath, tmp)
+        shift = 0.0
+        if peak_anchor is not None:
+            peak = max(t for (v, h, t) in g_nec.values() if t > -900)
+            shift = peak_anchor - peak
+        if out_path:
+            write_csv(g_nec, out_path, rot if rot is not None else 0, bool(mirror), shift=shift)
+        return g_nec
+
+
 # ---------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--maa")
-    ap.add_argument("--freq", type=float)
-    ap.add_argument("--out")
+    ap = argparse.ArgumentParser(description="Convert MMANA-GAL .maa geometry to 1-degree Angle/Gain CSV via NEC2++")
+    ap.add_argument("--maa", required=True, help="Path to .maa file")
+    ap.add_argument("--freq", type=float, help="Single frequency in MHz")
+    ap.add_argument("--all-bands", action="store_true", help="Generate all 10 standard FT8 bands")
+    ap.add_argument("--set-name", help="Save all 10 bands directly into patterns-library/<set-name>")
+    ap.add_argument("--deploy", action="store_true", help="Activate set and restart analyzer container")
+    ap.add_argument("--out", help="Output file (for single freq) or output dir (for all bands)")
     ap.add_argument("--nec", default=NEC_DEFAULT)
     ap.add_argument("--eps", type=float, default=None)
     ap.add_argument("--sigma", type=float, default=None)
@@ -282,6 +306,37 @@ def main():
         wires, src = apply_stub_free(wires, src)
         print(f"[stub-free] {len(wires)} wires (drop wire removed, CP reconnected at "
               f"feedpoint), source now w{src[0]+1}{src[1]}")
+
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Multi-band batch mode
+    if args.all_bands or args.set_name:
+        if args.set_name:
+            out_dir = os.path.join(repo_dir, "patterns-library", args.set_name)
+        elif args.out:
+            out_dir = args.out
+        else:
+            out_dir = os.path.join(repo_dir, "patterns")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"[batch] Generating all 10 bands into: {out_dir}")
+        for f in STANDARD_BANDS:
+            target_csv = os.path.join(out_dir, f"{f:.3f}.csv")
+            g = solve_frequency(wires, src, f, args.nec, args.eps, args.sigma, args.rot, args.mirror, out_path=target_csv, peak_anchor=args.peak_anchor)
+            pk = max(t for (v, h, t) in g.values() if t > -900)
+            print(f"  -> {f:>6.3f} MHz: Peak {pk:5.2f} dBi => {os.path.basename(target_csv)}")
+        print("[batch] Done generating 10 bands.")
+
+        if args.deploy and args.set_name:
+            manage_script = os.path.join(repo_dir, "manage_patterns.sh")
+            if os.path.exists(manage_script):
+                print(f"[deploy] Activating set '{args.set_name}' via manage_patterns.sh...")
+                subprocess.run([manage_script, "activate", args.set_name], cwd=repo_dir, check=True)
+        return
+
+    # Single frequency mode
+    if not args.freq:
+        ap.error("Must specify either --freq <MHz> or --all-bands / --set-name <name>")
+
     with tempfile.TemporaryDirectory() as tmp:
         nepath = build_nec(wires, src, args.freq, args.eps, args.sigma, tmp)
         print(f"[nec] eps={args.eps} sigma={args.sigma} S/m freq={args.freq} MHz")

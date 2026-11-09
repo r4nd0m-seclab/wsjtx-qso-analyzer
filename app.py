@@ -59,8 +59,29 @@ UDP_PORT = int(os.environ.get("UDP_PORT", "2237"))
 DEFAULT_HOME_GRID = os.environ.get("HOME_GRID", "EL09")
 DEFAULT_MY_CALL = os.environ.get("MY_CALL", os.environ.get("CALLSIGN", "K5JEE"))
 DEFAULT_TX_POWER_W = float(os.environ.get("TX_POWER_W", "100.0"))
-NORTH_OFFSET_DEG = float(os.environ.get("NORTH_OFFSET_DEG", "0.0"))
+NORTH_OFFSET_DEG = float(os.environ.get("NORTH_OFFSET_DEG", "331.46"))
 PATTERNS_DIR = os.environ.get("PATTERNS_DIR", "patterns")
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "config")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "radar_settings.json")
+
+def load_radar_settings() -> Dict[str, Any]:
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Settings] Warning reading {SETTINGS_FILE}: {e}")
+    return {}
+
+def save_radar_settings(updates: Dict[str, Any]):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        cur = load_radar_settings()
+        cur.update(updates)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cur, f, indent=2)
+    except Exception as e:
+        print(f"[Settings] Error saving {SETTINGS_FILE}: {e}")
 DEFAULT_CQ_ONLY = os.environ.get("CQ_ONLY", "true").lower() in ("true", "1", "yes")
 DEFAULT_HIDE_WORKED = os.environ.get("HIDE_WORKED", "true").lower() in ("true", "1", "yes")
 DEFAULT_TX_FREQ_OPTIMIZE = os.environ.get("TX_FREQ_OPTIMIZE", "true").lower() in ("true", "1", "yes")
@@ -101,13 +122,21 @@ class MmanaGainPattern:
         self.north_offset = north_offset_deg
         self.gain_grid: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
         self.max_gain = -999.0
-        self.peak_coord = (0, 0)
+        self.peak_coord = (0, 0, 90) # (az, el, zen)
+        self.fwd_peak_gain = -999.0
+        self.fwd_peak_coord = (0, 0, 90) # (0, el, zen)
         self.loaded = False
+        self.mtime = 0.0
         if os.path.exists(csv_path):
             self._load(csv_path)
 
     def _load(self, path: str):
         try:
+            self.gain_grid.clear()
+            self.max_gain = -999.0
+            self.peak_coord = (0, 0, 90)
+            self.fwd_peak_gain = -999.0
+            self.fwd_peak_coord = (0, 0, 90)
             with open(path, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 header = next(reader)
@@ -122,14 +151,37 @@ class MmanaGainPattern:
                     if elev >= 0.0:
                         az_idx = int(round(az)) % 360
                         el_idx = int(round(elev))
+                        zen_idx = int(round(zenith))
                         self.gain_grid[(az_idx, el_idx)] = (vert, hori, tot)
                         if tot > self.max_gain:
                             self.max_gain = tot
-                            self.peak_coord = (az_idx, el_idx)
+                            self.peak_coord = (az_idx, el_idx, zen_idx)
+                        if az_idx == 0 and tot > self.fwd_peak_gain:
+                            self.fwd_peak_gain = tot
+                            self.fwd_peak_coord = (0, el_idx, zen_idx)
+            self.mtime = os.path.getmtime(path)
             self.loaded = True
-            print(f"[Antenna] Loaded {len(self.gain_grid)} points from {os.path.basename(path)}. Peak: {self.max_gain:.2f} dBi at Az {self.peak_coord[0]}°, El {self.peak_coord[1]}°")
+            print(f"[Antenna] Loaded {len(self.gain_grid)} points from {os.path.basename(path)}. "
+                  f"Peak: {self.max_gain:.2f} dBi at Az {self.peak_coord[0]}°, El {self.peak_coord[1]}° (Zen {self.peak_coord[2]}°); "
+                  f"Fwd (Az 0°): {self.fwd_peak_gain:.2f} dBi at El {self.fwd_peak_coord[1]}° (Zen {self.fwd_peak_coord[2]}°)")
         except Exception as e:
             print(f"[Antenna] Failed to load pattern from {path}: {e}")
+
+    def reload_if_changed(self) -> bool:
+        if not os.path.exists(self.csv_path):
+            return False
+        try:
+            current_mtime = os.path.getmtime(self.csv_path)
+            if current_mtime > self.mtime:
+                print(f"[Antenna] File {os.path.basename(self.csv_path)} modified on disk (mtime {current_mtime} > {self.mtime}). Hot-reloading...")
+                self._load(self.csv_path)
+                return True
+        except Exception as e:
+            print(f"[Antenna] Error checking mtime for {self.csv_path}: {e}")
+        return False
+
+    def set_north_offset(self, north_offset_deg: float):
+        self.north_offset = north_offset_deg
 
     def get_gain(self, azimuth_deg: float, elevation_deg: float) -> Tuple[float, float, float]:
         if not self.loaded:
@@ -176,6 +228,18 @@ class AntennaPatternManager:
 
         print(f"[PatternManager] Discovered {len(self.file_map)} band pattern files in {self.patterns_dir}: {sorted(self.file_map.keys())} MHz")
 
+    def check_reload(self) -> bool:
+        """Checks if active pattern file or any pattern in cache has changed on disk."""
+        reloaded = False
+        if self.active_pattern and self.active_pattern.reload_if_changed():
+            reloaded = True
+        return reloaded
+
+    def set_north_offset(self, north_offset_deg: float):
+        self.north_offset = north_offset_deg
+        for pat in self.patterns_cache.values():
+            pat.set_north_offset(north_offset_deg)
+
     def set_frequency(self, freq_mhz: float) -> bool:
         """Selects and activates the best matching pattern file for the given dial frequency."""
         if not self.file_map:
@@ -188,10 +252,14 @@ class AntennaPatternManager:
         filename = os.path.basename(target_path)
 
         if self.active_filename == filename and self.active_pattern is not None:
-            return False # Already active
+            if self.active_pattern.reload_if_changed():
+                return True
+            return False # Already active and unchanged
 
         if filename not in self.patterns_cache:
             self.patterns_cache[filename] = MmanaGainPattern(target_path, self.north_offset)
+        else:
+            self.patterns_cache[filename].reload_if_changed()
 
         self.active_pattern = self.patterns_cache[filename]
         self.active_filename = filename
@@ -1288,6 +1356,14 @@ class State:
         self.cq_only = DEFAULT_CQ_ONLY
         self.hide_worked = DEFAULT_HIDE_WORKED
         self.psk_reporter = DEFAULT_PSK_REPORTER
+        saved_settings = load_radar_settings()
+        self.north_offset_deg = float(saved_settings.get("north_offset_deg", NORTH_OFFSET_DEG))
+        self.radar_elevation = saved_settings.get("radar_elevation", None)
+        if self.radar_elevation is not None:
+            try:
+                self.radar_elevation = float(self.radar_elevation)
+            except (ValueError, TypeError):
+                self.radar_elevation = None
         self.wsjt_client_id = "WSJT-X"
         self.wsjt_remote_addr: Optional[Tuple[str, int]] = None
         
@@ -2019,9 +2095,27 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         ranked_list.append(d)
                     ranked_list.sort(key=lambda x: x["score"], reverse=True)
                     
+                    if state.pattern_manager and state.pattern_manager.check_reload():
+                        rescore_all_decodes()
+
                     active_pat = state.pattern_manager.active_pattern if state.pattern_manager else None
-                    pattern_slice = active_pat.get_azimuth_slice(15.0) if active_pat else []
+                    if state.radar_elevation is not None and active_pat:
+                        current_el = float(state.radar_elevation)
+                    elif active_pat:
+                        current_el = float(active_pat.fwd_peak_coord[1])
+                    else:
+                        current_el = 15.0
+                    
+                    current_zen = round(90.0 - current_el, 1)
+                    pattern_slice = active_pat.get_azimuth_slice(current_el) if active_pat else []
                     peak_gain = active_pat.max_gain if active_pat else 0.0
+                    peak_el = active_pat.peak_coord[1] if active_pat else 0
+                    peak_zen = round(90.0 - peak_el, 1)
+                    fwd_peak_gain = active_pat.fwd_peak_gain if active_pat else 0.0
+                    fwd_el = active_pat.fwd_peak_coord[1] if active_pat else 0
+                    fwd_zen = round(90.0 - fwd_el, 1)
+                    slice_peak = max(pattern_slice) if pattern_slice else 0.0
+
                     pattern_file = state.pattern_manager.active_filename if state.pattern_manager else "None"
                     band_name = state.pattern_manager.active_band_name if state.pattern_manager else ""
                     nominal_mhz = state.pattern_manager.active_freq_mhz if state.pattern_manager else 0.0
@@ -2061,7 +2155,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             "band": current_band,
                             "nominal_mhz": nominal_mhz,
                             "peak_gain": round(peak_gain, 2),
-                            "offset_deg": NORTH_OFFSET_DEG,
+                            "peak_elevation": peak_el,
+                            "peak_zenith": peak_zen,
+                            "fwd_peak_gain": round(fwd_peak_gain, 2),
+                            "fwd_peak_elevation": fwd_el,
+                            "fwd_peak_zenith": fwd_zen,
+                            "current_elevation": round(current_el, 1),
+                            "current_zenith": current_zen,
+                            "slice_peak_gain": round(slice_peak, 2),
+                            "offset_deg": round(state.north_offset_deg, 2),
+                            "slice": pattern_slice,
                             "slice_15deg": pattern_slice
                         },
                         "cq_only": state.cq_only,
@@ -2216,6 +2319,34 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         state.cq_only = bool(params["cq_only"])
                     if "hide_worked" in params:
                         state.hide_worked = bool(params["hide_worked"])
+                    if "north_offset_deg" in params:
+                        try:
+                            val = float(params["north_offset_deg"]) % 360.0
+                            state.north_offset_deg = val
+                            if state.pattern_manager:
+                                state.pattern_manager.set_north_offset(val)
+                            save_radar_settings({"north_offset_deg": val})
+                            rescore_all_decodes()
+                        except (ValueError, TypeError):
+                            pass
+                    if "radar_elevation" in params:
+                        try:
+                            val = params["radar_elevation"]
+                            if val == "auto" or val is None or val == "":
+                                state.radar_elevation = None
+                                save_radar_settings({"radar_elevation": None})
+                            else:
+                                el_val = max(0.0, min(90.0, float(val)))
+                                state.radar_elevation = el_val
+                                save_radar_settings({"radar_elevation": el_val})
+                        except (ValueError, TypeError):
+                            pass
+                    if params.get("reload_patterns"):
+                        if state.pattern_manager:
+                            state.pattern_manager.scan_patterns()
+                            if state.pattern_manager.active_pattern:
+                                state.pattern_manager.active_pattern._load(state.pattern_manager.active_pattern.csv_path)
+                            rescore_all_decodes()
                     if "tx_freq_optimize" in params:
                         state.tx_freq_optimize = bool(params["tx_freq_optimize"])
                         if state.tx_freq_optimize:
@@ -2239,7 +2370,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     "cq_only": state.cq_only,
                     "hide_worked": state.hide_worked,
                     "tx_freq_optimize": state.tx_freq_optimize,
-                    "psk_reporter": state.psk_reporter
+                    "psk_reporter": state.psk_reporter,
+                    "north_offset_deg": state.north_offset_deg,
+                    "radar_elevation": state.radar_elevation
                 })
                 return
             except Exception as e:
@@ -2258,7 +2391,7 @@ def main():
     print("=" * 80)
     
     # Initialize Multi-Band Antenna Pattern Manager
-    state.pattern_manager = AntennaPatternManager(PATTERNS_DIR, north_offset_deg=NORTH_OFFSET_DEG)
+    state.pattern_manager = AntennaPatternManager(PATTERNS_DIR, north_offset_deg=state.north_offset_deg)
     # Set initial active pattern for default frequency (e.g. 14.074 MHz / 20m)
     state.pattern_manager.set_frequency(state.dial_freq_hz / 1e6)
     

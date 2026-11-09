@@ -8,6 +8,7 @@ __pycache__/
 .env
 *.env
 *credentials*.json
+config/
 
 # OS and editor files
 .DS_Store

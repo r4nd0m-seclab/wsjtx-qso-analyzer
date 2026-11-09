@@ -1,8 +1,8 @@
 {
   "eps": 13.0,
-  "sigma": 0.002,
+  "sigma": 0.005,
   "rot": 0,
   "mirror": false,
-  "ref": "patterns/14.074.csv",
-  "note": "Ground = user's MMANA panel (Dielec 13, Conduct 2.0 mS/m, Real). rot=0: NEC phi 0 = MMANA az 0 (radiator axis), confirmed by stub-free 20m/30m lobe at az 0. NOTE: NEC real-ground level runs ~4-8 dB below MMANA and the elevation shape differs (peak el 25 vs 32) — for deployment use --peak-anchor to level-calibrate to the neighboring-bands peak trend, not --validate mean-diff."
+  "ref": "patterns/28.074.csv",
+  "mean_diff_dbi": 5.018
 }

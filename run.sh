@@ -9,10 +9,12 @@ MODE="${1:-local}"
 
 if [ "$MODE" = "podman" ]; then
     echo "=== Building and running via Podman ==="
+    mkdir -p "$DIR/config"
     podman build -t wsjtx-qso-analyzer .
     podman rm -f wsjtx-qso-analyzer 2>/dev/null || true
     podman run -d --name wsjtx-qso-analyzer --network host \
         -v "$DIR/patterns:/app/patterns:ro" \
+        -v "$DIR/config:/app/config:rw" \
         -v "$HOME/.local/share/WSJT-X:/wsjtx-data:ro" \
         wsjtx-qso-analyzer
     echo "Container running! Open http://localhost:8080"
@@ -20,10 +22,12 @@ if [ "$MODE" = "podman" ]; then
 
 elif [ "$MODE" = "docker" ]; then
     echo "=== Building and running via Docker ==="
+    mkdir -p "$DIR/config"
     docker build -t wsjtx-qso-analyzer .
     docker rm -f wsjtx-qso-analyzer 2>/dev/null || true
     docker run -d --name wsjtx-qso-analyzer --network host \
         -v "$DIR/patterns:/app/patterns:ro" \
+        -v "$DIR/config:/app/config:rw" \
         -v "$HOME/.local/share/WSJT-X:/wsjtx-data:ro" \
         wsjtx-qso-analyzer
     echo "Container running! Open http://localhost:8080"

@@ -10,9 +10,11 @@ services:
       - HTTP_PORT=8080
       - UDP_PORT=2237
       - HOME_GRID=EL09
-      - NORTH_OFFSET_DEG=151.5
+      - NORTH_OFFSET_DEG=331.46
       - PATTERNS_DIR=/app/patterns
+      - CONFIG_DIR=/app/config
     volumes:
       - ./patterns:/app/patterns:ro
+      - ./config:/app/config:rw
       - ~/.local/share/WSJT-X:/wsjtx-data:ro
     restart: unless-stopped

@@ -83,7 +83,7 @@
 
     .bottom-grid {
       display: grid;
-      grid-template-columns: 360px 1fr;
+      grid-template-columns: 1fr 440px;
       gap: 1.25rem;
     }
     @media (max-width: 900px) {
@@ -418,15 +418,34 @@
       
       <!-- Antenna Directivity Radar -->
       <div class="card">
-        <div class="card-header">
+        <div class="card-header" style="flex-wrap: wrap; gap: 0.5rem;">
           <div class="card-title">Antenna Azimuth Radar</div>
-          <span style="font-size: 0.75rem; color: var(--text-muted);" id="radar-elevation-label">El: ~15°</span>
+          <span style="font-size: 0.75rem; color: var(--text-muted);" id="radar-elevation-label">--</span>
+        </div>
+        <!-- Elevation (Zenith) and Heading Controls -->
+        <div style="padding: 0.45rem 0.85rem; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.78rem; background: rgba(0,0,0,0.2);">
+          <div style="display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap;">
+            <span style="color: var(--text-muted); font-weight: 600;">El:</span>
+            <input type="number" id="radar-el-input" min="0" max="90" step="0.5" style="width: 60px; background: #0f172a; border: 1px solid var(--border); color: #fff; padding: 2px 4px; border-radius: 4px; font-size: 0.78rem; text-align: center;" onchange="setRadarElevation(this.value)">
+            <span id="radar-zen-label" style="color: var(--text-muted); font-size: 0.75rem;">(Zen: --°)</span>
+            <div class="btn-group" style="margin-left: 0.25rem;">
+              <button class="btn" id="btn-mmana-el" onclick="setPresetElevation('mmana')" title="Match MMANA-GAL forward peak elevation" style="padding: 2px 6px; font-size: 0.72rem;">MMANA</button>
+              <button class="btn" id="btn-peak-el" onclick="setPresetElevation('3d')" title="Global 3D peak gain elevation" style="padding: 2px 6px; font-size: 0.72rem;">3D Peak</button>
+              <button class="btn" id="btn-dx-el" onclick="setPresetElevation('dx')" title="DX takeoff angle (15°)" style="padding: 2px 6px; font-size: 0.72rem;">DX 15°</button>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.35rem;">
+            <span style="color: var(--text-muted); font-weight: 600;">Hdg:</span>
+            <input type="number" id="radar-hdg-input" min="0" max="359.9" step="0.5" style="width: 100px; background: #0f172a; border: 1px solid var(--border); color: #38bdf8; font-weight: 700; padding: 2px 4px; border-radius: 4px; font-size: 0.78rem; text-align: center;" onchange="setRadarHeading(this.value)">
+            <span style="color: var(--text-muted); font-size: 0.75rem;">°</span>
+          </div>
         </div>
         <div class="radar-container">
-          <canvas id="radar" width="300" height="300"></canvas>
+          <canvas id="radar" width="400" height="400"></canvas>
           <div style="font-size: 0.75rem; color: var(--text-muted); text-align: center;">
             <span style="color: #38bdf8;">■</span> MMANA-GAL Envelope &nbsp;|&nbsp;
-            <span style="color: #34d399;">●</span> Decoded Target
+            <span style="color: #34d399;">●</span> Decoded Target &nbsp;|&nbsp;
+            <span style="color: #f59e0b;">▲</span> <span id="radar-hdg-legend">Hdg: 331.5°</span>
           </div>
         </div>
       </div>
@@ -567,6 +586,45 @@
       }).catch(e => {
         showToast(`Network error: ${e}`, true);
       });
+    }
+
+    let latestPattern = null;
+
+    function setRadarElevation(val) {
+      const num = parseFloat(val);
+      if (!isNaN(num)) {
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ radar_elevation: num })
+        }).then(() => pollState()).catch(console.error);
+      }
+    }
+
+    function setPresetElevation(preset) {
+      if (!latestPattern) return;
+      let targetEl = 15.0;
+      if (preset === 'mmana') {
+        targetEl = latestPattern.fwd_peak_elevation !== undefined ? latestPattern.fwd_peak_elevation : 78.4;
+      } else if (preset === '3d') {
+        targetEl = latestPattern.peak_elevation !== undefined ? latestPattern.peak_elevation : 33.0;
+      } else if (preset === 'dx') {
+        targetEl = 15.0;
+      }
+      const elInput = document.getElementById('radar-el-input');
+      if (elInput) elInput.value = targetEl;
+      setRadarElevation(targetEl);
+    }
+
+    function setRadarHeading(val) {
+      const num = parseFloat(val);
+      if (!isNaN(num)) {
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ north_offset_deg: num })
+        }).then(() => pollState()).catch(console.error);
+      }
     }
 
     // UTC Clock
@@ -735,6 +793,7 @@
         // Antenna Pattern
         if (data.pattern) {
           const pat = data.pattern;
+          latestPattern = pat;
           const badgeEl = document.getElementById('pattern-badge');
           if (badgeEl) {
             badgeEl.innerText = pat.filename ? `${pat.filename} (${pat.band || ''})` : '--';
@@ -743,10 +802,33 @@
           const radarLbl = document.getElementById('radar-elevation-label');
           if (radarLbl) {
             const peakStr = (pat.peak_gain !== undefined && pat.peak_gain >= 0) ? `+${pat.peak_gain}` : `${pat.peak_gain}`;
-            radarLbl.innerText = `${pat.filename} (${pat.band}) | Peak: ${peakStr} dBi | El: ~15°`;
+            const sliceStr = (pat.slice_peak_gain !== undefined && pat.slice_peak_gain >= 0) ? `+${pat.slice_peak_gain}` : `${pat.slice_peak_gain}`;
+            radarLbl.innerText = `${pat.filename} (${pat.band}) | El: ${pat.current_elevation}° (Zen: ${pat.current_zenith}°) | Slice: ${sliceStr} dBi | 3D Peak: ${peakStr} dBi`;
           }
 
-          if (pat.slice_15deg) {
+          const elInput = document.getElementById('radar-el-input');
+          if (elInput && document.activeElement !== elInput) {
+            elInput.value = pat.current_elevation !== undefined ? pat.current_elevation : 15;
+          }
+
+          const zenLbl = document.getElementById('radar-zen-label');
+          if (zenLbl) {
+            zenLbl.innerText = `(Zen: ${pat.current_zenith !== undefined ? pat.current_zenith : '--'}°)`;
+          }
+
+          const hdgInput = document.getElementById('radar-hdg-input');
+          if (hdgInput && document.activeElement !== hdgInput) {
+            hdgInput.value = pat.offset_deg !== undefined ? pat.offset_deg : 331.5;
+          }
+
+          const hdgLegend = document.getElementById('radar-hdg-legend');
+          if (hdgLegend) {
+            hdgLegend.innerText = `Hdg: ${pat.offset_deg !== undefined ? pat.offset_deg : 331.5}°`;
+          }
+
+          if (pat.slice) {
+            antennaPatternSlice = pat.slice;
+          } else if (pat.slice_15deg) {
             antennaPatternSlice = pat.slice_15deg;
           }
         }
@@ -950,7 +1032,7 @@
           <tr>
             <td style="color: var(--text-muted); font-weight: 700;">#${idx + 1}</td>
             <td>
-              <button class="btn-call" onclick="sendReply('${d.call}', '${escapeMsg(d.message)}', ${d.snr}, ${d.qtime_ms}, ${d.df}, ${d.dt}, '${d.mode}')">
+              <button class="btn-call" onclick="sendReply('${d.call}', '${escapeMsg(d.message)}', ${d.snr}, ${d.qtime_ms}, ${d.df}, ${d.dt}, '${d.mode}', ${d.el})">
                 CALL
               </button>
             </td>
@@ -1017,7 +1099,8 @@
       }, 3500);
     }
 
-    async function sendReply(call, msg, snr, qtime_ms, df, dt, mode) {
+    async function sendReply(call, msg, snr, qtime_ms, df, dt, mode, el) {
+      setRadarElevation(el);
       try {
         const resp = await fetch('/api/reply', {
           method: 'POST',
@@ -1107,6 +1190,29 @@
         ctx.strokeStyle = '#38bdf8';
         ctx.lineWidth = 1.5;
         ctx.stroke();
+      }
+
+      // Draw Antenna Heading Pointer Line
+      if (latestPattern && latestPattern.offset_deg !== undefined) {
+        const hdg = latestPattern.offset_deg;
+        const theta = (hdg - 90) * (Math.PI / 180.0);
+        ctx.beginPath();
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.7)';
+        ctx.lineWidth = 1.5;
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + r * Math.cos(theta), cy + r * Math.sin(theta));
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Small indicator arrowhead at perimeter
+        const ax = cx + (r + 7) * Math.cos(theta);
+        const ay = cy + (r + 7) * Math.sin(theta);
+        ctx.fillStyle = '#f59e0b';
+        ctx.font = 'bold 9px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('▲', ax, ay);
       }
 
       // Plot Decoded Targets as Points
