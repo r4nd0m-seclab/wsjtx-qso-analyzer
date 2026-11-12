@@ -546,7 +546,7 @@
       }).then(r => r.json()).then(res => {
         if (res.success) {
           if (checked) {
-            showToast('✓ PSK-RPT enabled (observed propagation scoring)');
+            showToast('✓ PSK-RPT enabled (live MQTT stream + 60m ground-truth)');
           } else {
             showToast('PSK-RPT disabled (model-only scoring)');
           }
@@ -868,6 +868,7 @@
           pskToggle.checked = !!data.psk_reporter;
         }
 
+        const pskStatPill = document.getElementById('psk-stat-pill');
         const pskSpotsCount = document.getElementById('psk-spots-count');
         const pskAgeLabel = document.getElementById('psk-age-label');
         const pskMapLink = document.getElementById('psk-map-link');
@@ -876,19 +877,35 @@
         if (data.psk_reporter) {
           const count = pskStats.total_spots || 0;
           const countText = `${count} spot${count === 1 ? '' : 's'}`;
-          const ageText = pskStats.age_str ? `(${pskStats.age_str})` : '';
+          const isLive = !!pskStats.mqtt_live;
+          const ageText = isLive ? '● LIVE' : (pskStats.age_str ? `(${pskStats.age_str})` : '');
 
           if (pskSpotsCount) {
             pskSpotsCount.innerText = countText;
             pskSpotsCount.style.color = count > 0 ? '#34d399' : '#fff';
           }
-          if (pskAgeLabel) pskAgeLabel.innerText = ageText;
+          if (pskAgeLabel) {
+            pskAgeLabel.innerText = ageText;
+            pskAgeLabel.style.color = isLive ? '#34d399' : 'var(--text-muted)';
+            pskAgeLabel.style.fontWeight = isLive ? '600' : '400';
+          }
+          if (pskStatPill) {
+            const rxCount = pskStats.mqtt_spots_rx || 0;
+            const httpAge = pskStats.http_age_str || pskStats.age_str || 'never';
+            const lastSpotAge = (pskStats.last_spot_age_s !== null && pskStats.last_spot_age_s !== undefined)
+              ? `, last live spot ${pskStats.last_spot_age_s}s ago`
+              : '';
+            pskStatPill.title = isLive
+              ? `Live MQTT stream (${pskStats.mqtt_broker || 'pskreporter'}) · ${count} spots in 60m window (+${rxCount} streamed${lastSpotAge}, HTTP seed ${httpAge})`
+              : `PSK-RPT HTTP polling (${httpAge}) · ${count} spots in 60m window`;
+          }
         } else {
           if (pskSpotsCount) {
             pskSpotsCount.innerText = 'Off';
             pskSpotsCount.style.color = 'var(--text-muted)';
           }
           if (pskAgeLabel) pskAgeLabel.innerText = '';
+          if (pskStatPill) pskStatPill.title = 'Toggle PSK-RPT ground-truth propagation scoring';
         }
 
         if (data.de_call && pskMapLink) {

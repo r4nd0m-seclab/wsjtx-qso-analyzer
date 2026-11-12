@@ -1,6 +1,6 @@
 # WSJT-X QSO Analyzer (Web GUI & UDP Companion)
 
-A containerized, real-time ham radio station companion that listens to **WSJT-X decodes** over UDP port `2237`, resolves **Country and US/Canadian State codes** via Big CTY DXCC data and Maidenhead grid mapping, computes link margin and two-way QSO probability using **MMANA-GAL 3D far-field radiation patterns**, factors in **real-time space weather** from [solar.w5mmw.net](https://solar.w5mmw.net/), and displays an interactive dark-mode dashboard on `http://localhost:8080`.
+A containerized, real-time ham radio station companion that listens to **WSJT-X decodes** over UDP port `2237`, resolves **Country and US/Canadian State codes** via Big CTY DXCC data and Maidenhead grid mapping, computes link margin and two-way QSO probability using **MMANA-GAL 3D far-field radiation patterns**, verifies empirical propagation in real time via **PSK Reporter live MQTT streaming + 60-minute HTTP seeding**, factors in **real-time space weather** from [solar.w5mmw.net](https://solar.w5mmw.net/), and displays an interactive dark-mode dashboard on `http://localhost:8080`.
 
 ---
 
@@ -15,11 +15,14 @@ A containerized, real-time ham radio station companion that listens to **WSJT-X 
 |  |  Transceiver GUI   | <----------------------- | (Host Network Mode)       |  |
 |  +--------------------+        Type 4 Reply      |                           |  |
 |                                                  | - UDP Protocol Parser     |  |
-|                                                  | - Country / State Resolver|  |
-|                                                  | - MMANA-GAL Spatial Gain  |  |
+|  +--------------------+   TLS/WSS MQTT + HTTPS   | - Country / State Resolver|  |
+|  |  PSK Reporter      | -----------------------> | - PSK-RPT Live Streamer   |  |
+|  |  (v2 MQTT + XML)   |                          | - MMANA-GAL Spatial Gain  |  |
 |  +--------------------+                          | - Space Weather Poller    |  |
-|  | Web Browser/Tablet | <====== HTTP / JSON ===> | - Port 8080 Dashboard     |  |
-|  | (Local or LAN)     |                          +---------------------------+  |
+|                                                  | - Port 8080 Dashboard     |  |
+|  +--------------------+                          +---------------------------+  |
+|  | Web Browser/Tablet | <====== HTTP / JSON ===>               ^                |
+|  | (Local or LAN)     | ---------------------------------------+                |
 |  +--------------------+                                                         |
 +---------------------------------------------------------------------------------+
 ```
@@ -37,6 +40,7 @@ A containerized, real-time ham radio station companion that listens to **WSJT-X 
 7. **Antenna Directivity Radar:** HTML5 Canvas polar radar plot displaying the antenna's radiation envelope alongside plotted decoded station bearings.
 8. **TX Passband Optimization:** Monitors rolling 60-second passband activity to detect sub-frequency collisions and direct WSJT-X to the clearest open transmission slot.
 9. **Directed CQ Compliance Filtering:** Automatically parses targeted CQ modifiers (`CQ DX`, US states `CQ TX`, continents `CQ NA`/`CQ EU`, countries/prefixes `CQ JA`/`CQ VK`). Non-matching calls are restricted and suppressed from the candidate table so operators only see QSOs they are eligible to answer.
+10. **Real-Time PSK Reporter Ground-Truth Streaming:** Mirrors `pskreporter.info`'s hybrid browser architecture — seeds the initial 60-minute reception window once via HTTPS XML query, then streams incoming TX reception reports in real time over PSK Reporter's public MQTT v2 feed using a zero-dependency Python stdlib TLS/WSS client. Active WSJT-X candidates rescore within 1 second of spot arrival.
 
 ---
 
@@ -60,7 +64,7 @@ cd web
 ```
 
 ### Option 3: Run Directly with Python (No Dependencies)
-The backend uses Python's standard library (`socket`, `struct`, `http.server`, `urllib`, `threading`):
+The backend uses only Python's standard library (`socket`, `ssl`, `select`, `struct`, `http.server`, `urllib`, `threading`):
 ```bash
 cd web
 python3 app.py
@@ -114,3 +118,43 @@ The service automatically discovers and indexes all band pattern CSV files insid
 
 **Dynamic Band Tracking:**
 Whenever you switch bands in WSJT-X, WSJT-X broadcasts its new dial frequency in a Status packet (Type 1). The scorer automatically detects the frequency change, loads the matching MMANA-GAL radiation pattern from `patterns/`, re-draws the azimuth radar, and scores incoming decodes against that band's exact far-field pattern without requiring any manual intervention or restarts.
+
+---
+
+## PSK Reporter Ground-Truth Propagation (Live MQTT + HTTP Seed)
+
+Instead of relying solely on 5-minute HTTP polling, `PskReporterManager` and `psk_mqtt_streamer` combine historical HTTP seeding with real-time MQTT streaming — matching how `pskreporter.info/pskmap.html` operates in the browser while requiring **zero third-party Python dependencies**:
+
+1. **60-Minute Historical Seed (HTTPS):**
+   On startup, the service fetches the trailing 1-hour reception window (`flowStartSeconds=-3600`) for your station callsign from `retrieve.pskreporter.info/query`.
+2. **Real-Time Spot Streaming (MQTT v2 over TLS / WSS):**
+   A persistent stdlib MQTT 3.1.1 client connects to `mqtt.pskreporter.info:1884` over TLS (with automatic failover to `wss://mqtt2.pskreporter.info:1886/mqtt` over RFC 6455 WebSockets and `:1883` TCP) and subscribes to:
+   ```text
+   pskr/filter/v2/+/+/<DE_CALL>/+/+/+/+/+
+   ```
+   As remote monitors upload FT8/FT4 spots at the end of your 15-second TX slot, spots merge into the rolling 3600-second window and active candidate rows rescore within 1 second (`● LIVE` indicator in the top toolbar).
+3. **Reduced HTTP Polling & Non-Destructive Merge:**
+   While the MQTT stream is live, full HTTP refetches drop from every **5 minutes** to every **15 minutes** (automatically reverting to 5-minute HTTP polling if MQTT is unreachable or if operating with a `/` portable callsign that cannot appear in an MQTT topic level). HTTP syncs preserve any live MQTT spots that are newer than PSK Reporter's XML query database snapshot.
+4. **Seamless Multi-Band QSY & Warm Restart Cache:**
+   - Because the MQTT subscription wildcards both `{band}` and `{mode}` (`+`) and indexes spots by each report's RF frequency, band changes in WSJT-X require zero reconnects or extra HTTP queries — all bands worked within the past hour stay warm in memory simultaneously.
+   - Rolling spots are persisted to `config/psk_spots_cache.json` (`0600` permissions, git-ignored) so container restarts (such as swapping antenna pattern sets) retain the 60-minute propagation window and avoid HTTP `429` rate limits.
+
+### Empirical Scoring Tiers
+
+When **`[✓] PSK-RPT`** is enabled, each decoded station is matched against your rolling 60-minute reception reports:
+
+| Match Tier | Badge | Condition | Scoring Impact |
+|---|---|---|---|
+| `direct_band` | **`2-WAY +XdB`** | Station heard your signal on the **active band** | Computes true two-way link bottleneck $\min(\text{RX margin}, \text{TX margin})$ + **+12 pt** verified confidence bonus |
+| `direct_other` | **`HEARD (<band>)`** | Station heard your signal recently on **another band** | Base link margin + **+5 pt** active-monitor confidence bonus |
+| `grid4` | **`⚡` (`PATH <grid4>`)** | One or more stations in the same 4-char Maidenhead grid heard you on this band | Blends modeled margin (70%) with observed regional TX margin (30%) + **+2 to +6 pt** path-openness bonus |
+| `grid2` | **`⚡` (`PATH <field>`)** | Stations in the same 2-char Maidenhead field heard you on this band | Base link margin + **+3 pt** regional propagation bonus |
+
+### Optional Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MY_CALL` / `CALLSIGN` | Auto-learned from WSJT-X UDP (`DE Call`) | Station callsign used before the first WSJT-X Status packet arrives |
+| `PSK_REPORTER` | `true` | Enable PSK Reporter ground-truth scoring by default at startup |
+| `PSK_MQTT_URL` | *(auto failover list)* | Optional explicit broker override (`mqtts://host:1884`, `wss://host:1886/mqtt`, or `mqtt://host:1883`) |
+| `CONFIG_DIR` | `config` (`/app/config` in container) | Directory for persistent radar settings and `psk_spots_cache.json` |

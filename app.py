@@ -13,11 +13,14 @@ import json
 import math
 import os
 import re
+import select
 import socket
+import ssl
 import struct
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zlib
 from urllib.error import HTTPError
@@ -86,6 +89,8 @@ DEFAULT_CQ_ONLY = os.environ.get("CQ_ONLY", "true").lower() in ("true", "1", "ye
 DEFAULT_HIDE_WORKED = os.environ.get("HIDE_WORKED", "true").lower() in ("true", "1", "yes")
 DEFAULT_TX_FREQ_OPTIMIZE = os.environ.get("TX_FREQ_OPTIMIZE", "true").lower() in ("true", "1", "yes")
 DEFAULT_PSK_REPORTER = os.environ.get("PSK_REPORTER", "true").lower() in ("true", "1", "yes")
+PSK_MQTT_URL = os.environ.get("PSK_MQTT_URL", "").strip()
+PSK_SPOTS_CACHE_FILE = os.path.join(CONFIG_DIR, "psk_spots_cache.json")
 WSJTX_DATA_DIR = os.environ.get("WSJTX_DATA_DIR", "/wsjtx-data")
 
 # -----------------------------------------------------------------------------
@@ -1073,62 +1078,567 @@ def extract_call_and_grid(message: str) -> Tuple[Optional[str], Optional[str], b
     return None, None, False, None
 
 # -----------------------------------------------------------------------------
-# PSK Reporter Ground-Truth Propagation Service
+# PSK Reporter Ground-Truth Propagation Service (1h HTTP Seed + Live MQTT Stream)
 # -----------------------------------------------------------------------------
+class _PskMqttWire:
+    """
+    Zero-dependency MQTT 3.1.1 subscribe-only wire transport supporting:
+      - TLS raw MQTT (mqtt.pskreporter.info:1884)
+      - WSS MQTT over RFC 6455 WebSockets (wss://mqtt2.pskreporter.info:1886/mqtt)
+      - Plain TCP MQTT fallback (mqtt.pskreporter.info:1883)
+    """
+    def __init__(self, host: str, port: int, mode: str = "tls", ws_path: str = "/mqtt", timeout: float = 15.0):
+        self.host = host
+        self.port = port
+        self.mode = mode  # "tls", "wss", or "tcp"
+        self.ws_path = ws_path or "/mqtt"
+        self.timeout = timeout
+        self.sock: Optional[socket.socket] = None
+        self._rx_buf = bytearray()
+        self._ws_raw_buf = bytearray()
+
+    @staticmethod
+    def _encode_rem_len(length: int) -> bytes:
+        out = bytearray()
+        while True:
+            digit = length % 128
+            length //= 128
+            if length > 0:
+                digit |= 0x80
+            out.append(digit)
+            if length <= 0:
+                break
+        return bytes(out)
+
+    @staticmethod
+    def _mqtt_str(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack(">H", len(b)) + b
+
+    @classmethod
+    def build_connect(cls, client_id: str, keepalive: int = 60) -> bytes:
+        vh = cls._mqtt_str("MQTT") + bytes([4, 0x02]) + struct.pack(">H", keepalive)
+        pl = cls._mqtt_str(client_id)
+        body = vh + pl
+        return bytes([0x10]) + cls._encode_rem_len(len(body)) + body
+
+    @classmethod
+    def build_subscribe(cls, pkt_id: int, topic: str, qos: int = 0) -> bytes:
+        vh = struct.pack(">H", pkt_id)
+        pl = cls._mqtt_str(topic) + bytes([qos & 0x03])
+        body = vh + pl
+        return bytes([0x82]) + cls._encode_rem_len(len(body)) + body
+
+    @classmethod
+    def build_unsubscribe(cls, pkt_id: int, topic: str) -> bytes:
+        vh = struct.pack(">H", pkt_id)
+        pl = cls._mqtt_str(topic)
+        body = vh + pl
+        return bytes([0xA2]) + cls._encode_rem_len(len(body)) + body
+
+    def connect_socket(self):
+        raw = socket.create_connection((self.host, self.port), timeout=12.0)
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if self.mode in ("tls", "wss"):
+            ctx = ssl.create_default_context()
+            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        else:
+            self.sock = raw
+        self.sock.settimeout(self.timeout)
+        if self.mode == "wss":
+            self._ws_handshake()
+
+    def _ws_handshake(self):
+        assert self.sock is not None
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {self.ws_path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Protocol: mqtt\r\n\r\n"
+        )
+        self.sock.sendall(req.encode("ascii"))
+        hdr = bytearray()
+        while b"\r\n\r\n" not in hdr:
+            chunk = self.sock.recv(1024)
+            if not chunk:
+                raise ConnectionError("WSS handshake closed prematurely")
+            hdr.extend(chunk)
+            if len(hdr) > 16384:
+                raise ConnectionError("WSS handshake header overflow")
+        idx = hdr.index(b"\r\n\r\n") + 4
+        status_line = hdr[:idx].splitlines()[0].decode("latin1", "replace")
+        if "101" not in status_line:
+            raise ConnectionError(f"WSS upgrade failed: {status_line}")
+        self._ws_raw_buf = bytearray(hdr[idx:])
+
+    def has_pending_data(self) -> bool:
+        if self._rx_buf or self._ws_raw_buf:
+            return True
+        if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending() > 0:
+            return True
+        return False
+
+    def wait_readable(self, timeout_s: float = 2.0) -> bool:
+        if self.has_pending_data():
+            return True
+        if not self.sock:
+            return False
+        r, _, _ = select.select([self.sock], [], [], timeout_s)
+        return bool(r)
+
+    def _sock_recv_exact(self, buf: bytearray, n: int) -> bytes:
+        assert self.sock is not None
+        while len(buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(buf)))
+            if not chunk:
+                raise EOFError("MQTT socket closed")
+            buf.extend(chunk)
+        out = bytes(buf[:n])
+        del buf[:n]
+        return out
+
+    def _ws_send_frame(self, opcode: int, payload: bytes):
+        assert self.sock is not None
+        mask_key = os.urandom(4)
+        plen = len(payload)
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        if plen < 126:
+            header.append(0x80 | plen)
+        elif plen < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack(">H", plen))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack(">Q", plen))
+        header.extend(mask_key)
+        masked = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+
+    def _ws_pump_into_rx_buf(self):
+        while True:
+            b0, b1 = self._sock_recv_exact(self._ws_raw_buf, 2)
+            opcode = b0 & 0x0F
+            masked = (b1 & 0x80) != 0
+            plen = b1 & 0x7F
+            if plen == 126:
+                plen = struct.unpack(">H", self._sock_recv_exact(self._ws_raw_buf, 2))[0]
+            elif plen == 127:
+                plen = struct.unpack(">Q", self._sock_recv_exact(self._ws_raw_buf, 8))[0]
+            mkey = self._sock_recv_exact(self._ws_raw_buf, 4) if masked else b""
+            data = self._sock_recv_exact(self._ws_raw_buf, plen) if plen > 0 else b""
+            if masked:
+                data = bytes(b ^ mkey[i & 3] for i, b in enumerate(data))
+            if opcode in (0x00, 0x01, 0x02):
+                if data:
+                    self._rx_buf.extend(data)
+                    return
+            elif opcode == 0x09:  # WS Ping -> Pong
+                self._ws_send_frame(0x0A, data)
+            elif opcode == 0x08:  # WS Close
+                raise EOFError("WebSocket closed by broker")
+
+    def send_mqtt(self, data: bytes):
+        assert self.sock is not None
+        if self.mode == "wss":
+            self._ws_send_frame(0x02, data)
+        else:
+            self.sock.sendall(data)
+
+    def _read_bytes(self, n: int) -> bytes:
+        if self.mode == "wss":
+            while len(self._rx_buf) < n:
+                self._ws_pump_into_rx_buf()
+            out = bytes(self._rx_buf[:n])
+            del self._rx_buf[:n]
+            return out
+        return self._sock_recv_exact(self._rx_buf, n)
+
+    def read_packet(self) -> Tuple[int, bytes]:
+        b0 = self._read_bytes(1)[0]
+        mul = 1
+        rem_len = 0
+        while True:
+            d = self._read_bytes(1)[0]
+            rem_len += (d & 0x7F) * mul
+            if (d & 0x80) == 0:
+                break
+            mul *= 128
+            if mul > 128 * 128 * 128:
+                raise ValueError("Invalid MQTT remaining length")
+        body = self._read_bytes(rem_len) if rem_len > 0 else b""
+        return b0, body
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+
+def _parse_psk_mqtt_endpoints() -> List[Tuple[str, int, str, str]]:
+    """Returns ordered [(host, port, mode, ws_path), ...] brokers for PSKReporter MQTT."""
+    if PSK_MQTT_URL:
+        u = urllib.parse.urlparse(PSK_MQTT_URL)
+        scheme = (u.scheme or "").lower()
+        host = u.hostname or "mqtt.pskreporter.info"
+        path = u.path or "/mqtt"
+        if scheme == "wss":
+            return [(host, u.port or 1886, "wss", path)]
+        elif scheme in ("mqtts", "ssl", "tls"):
+            return [(host, u.port or 1884, "tls", "")]
+        else:
+            return [(host, u.port or 1883, "tcp", "")]
+    return [
+        ("mqtt.pskreporter.info", 1884, "tls", ""),
+        ("mqtt2.pskreporter.info", 1886, "wss", "/mqtt"),
+        ("mqtt.pskreporter.info", 1883, "tcp", ""),
+    ]
+
+
 class PskReporterManager:
     """
-    Fetches and caches ground-truth FT8 reception reports from PSK Reporter.
-    Provides two-way empirical link margin verification and regional path validation.
+    Hybrid ground-truth FT8/digital reception report manager mirroring pskreporter.info/pskmap.html:
+      1. Seeds the 60-minute window via HTTP XML query (retrieve.pskreporter.info/query).
+      2. Streams live spots in real time via PSKReporter's MQTT v2 feed:
+         pskr/filter/v2/+/+/{CALLSIGN}/+/+/+/+/+
+      3. Extends background HTTP full-refetch interval from 5m to 15m while MQTT is live,
+         merging newer MQTT spots without loss and persisting warm spots across restarts.
     """
-    def __init__(self, callsign: str = "K5JEE", min_interval_s: float = 300.0):
-        self.callsign = callsign.upper()
+    def __init__(
+        self,
+        callsign: str = "K5JEE",
+        min_interval_s: float = 300.0,
+        mqtt_refresh_interval_s: float = 900.0,
+        window_s: float = 3600.0,
+        cache_path: Optional[str] = None,
+    ):
+        self.callsign = callsign.strip().upper()
         self.min_interval_s = min_interval_s
+        self.mqtt_refresh_interval_s = mqtt_refresh_interval_s
+        self.window_s = window_s
+        self.max_spots = 5000
+        self.cache_path = cache_path or PSK_SPOTS_CACHE_FILE
+
         self.last_poll_time = 0.0
         self.last_poll_status = "idle"
         self.last_poll_error = ""
         self.lock = threading.RLock()
-        self.next_retry_time = 0.0  # Exponential backoff for 429
-        self.backoff_factor = 60.0  # Start at 60s, double each time
-        
+        self.wake_event = threading.Event()
+        self.next_retry_time = 0.0   # Exponential backoff for HTTP 429
+        self.backoff_factor = 60.0    # Start at 60s, double each time
+
+        # Live MQTT streaming state
+        self.mqtt_connected = False
+        self.mqtt_broker_label = ""
+        self.mqtt_subscribed_topic = ""
+        self.mqtt_spots_rx = 0
+        self.last_spot_time = 0.0
+        self._rescore_needed = False
+        self._cache_dirty = False
+        self._last_cache_save = 0.0
+
         self.total_spots = 0
         self.last_update_utc = ""
-        
-        # Indexed lookups:
-        # (receiver_call, band) -> spot dict
+
+        # Canonical rolling spot map: (rcall, band_lower) -> spot dict
+        self._spots: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # Indexed lookups rebuilt from self._spots:
+        # (receiver_call, band_lower) -> spot dict
         self.by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # receiver_call -> most recent spot dict across all bands
         self.by_call_latest: Dict[str, Dict[str, Any]] = {}
-        # (band, grid[:4]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
+        # (band_lower, grid[:4]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
         self.by_band_grid4: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        # (band, grid[:2]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
+        # (band_lower, grid[:2]) -> {"count": int, "avg_snr": float, "max_snr": int, "min_snr": int}
         self.by_band_grid2: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # band -> spot count
         self.band_counts: Dict[str, int] = {}
-        
+
+        self._load_cache()
+
+    @staticmethod
+    def can_stream_mqtt(callsign: str) -> bool:
+        """Matches pskmap.html mqttBuildFilter: MQTT topic levels cannot contain '/', '+', or '#'."""
+        c = (callsign or "").strip().upper()
+        if not c or c == "ZZZZZ":
+            return False
+        return not any(ch in c for ch in "/+#")
+
+    @staticmethod
+    def topic_for_callsign(callsign: str) -> str:
+        """PSKReporter v2 TX topic: pskr/filter/v2/{band}/{mode}/{tx_call}/{rx_call}/{tx_grid}/{rx_grid}/{tx_dxcc}/{rx_dxcc}."""
+        return f"pskr/filter/v2/+/+/{callsign.strip().upper()}/+/+/+/+/+"
+
+    def set_callsign(self, new_callsign: str):
+        norm = (new_callsign or "").strip().upper()
+        if not norm:
+            return
+        with self.lock:
+            if norm == self.callsign:
+                return
+            print(f"[PSKReporter] Callsign switched {self.callsign} -> {norm}; resetting ground-truth window")
+            self.callsign = norm
+            self._spots.clear()
+            self.last_poll_time = 0.0
+            self.next_retry_time = 0.0
+            self.last_spot_time = 0.0
+            self._rebuild_indexes_locked(time.time())
+            self._rescore_needed = True
+            self._cache_dirty = True
+        self.wake_event.set()
+
+    def set_mqtt_state(self, connected: bool, broker_label: str = "", topic: str = ""):
+        with self.lock:
+            self.mqtt_connected = connected
+            self.mqtt_broker_label = broker_label if connected else ""
+            self.mqtt_subscribed_topic = topic if connected else ""
+
     def should_poll(self) -> bool:
-        return (time.time() - self.last_poll_time) >= self.min_interval_s and time.time() >= self.next_retry_time
+        with self.lock:
+            now = time.time()
+            if now < self.next_retry_time:
+                return False
+            if self.last_poll_time <= 0.0:
+                return True
+            interval = self.mqtt_refresh_interval_s if self.mqtt_connected else self.min_interval_s
+            return (now - self.last_poll_time) >= interval
+
+    def consume_rescore_needed(self) -> bool:
+        with self.lock:
+            if self._rescore_needed:
+                self._rescore_needed = False
+                return True
+            return False
+
+    def _rebuild_indexes_locked(self, now: float) -> int:
+        """Prunes spots older than window_s and rebuilds fast lookup tables. Caller holds self.lock."""
+        cutoff = now - self.window_s
+        expired_keys = [k for k, sp in self._spots.items() if sp.get("flow_sec", 0) < cutoff]
+        for k in expired_keys:
+            self._spots.pop(k, None)
+
+        if len(self._spots) > self.max_spots:
+            ordered = sorted(self._spots.items(), key=lambda kv: kv[1].get("flow_sec", 0), reverse=True)
+            self._spots = dict(ordered[:self.max_spots])
+
+        new_by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        new_by_call_latest: Dict[str, Dict[str, Any]] = {}
+        grid4_acc: Dict[Tuple[str, str], List[int]] = {}
+        grid2_acc: Dict[Tuple[str, str], List[int]] = {}
+        new_band_counts: Dict[str, int] = {}
+
+        for (rcall, band_key), sp in self._spots.items():
+            flow_sec = sp["flow_sec"]
+            sp["age_min"] = max(0, round((now - flow_sec) / 60.0))
+            band_disp = sp["band"]
+            new_band_counts[band_disp] = new_band_counts.get(band_disp, 0) + 1
+
+            new_by_call_band[(rcall, band_key)] = sp
+            prev_latest = new_by_call_latest.get(rcall)
+            if prev_latest is None or flow_sec > prev_latest["flow_sec"]:
+                new_by_call_latest[rcall] = sp
+
+            rgrid = sp.get("grid", "")
+            snr = sp.get("snr", -99)
+            if len(rgrid) >= 4:
+                grid4_acc.setdefault((band_key, rgrid[:4]), []).append(snr)
+            if len(rgrid) >= 2:
+                grid2_acc.setdefault((band_key, rgrid[:2]), []).append(snr)
+
+        self.by_call_band = new_by_call_band
+        self.by_call_latest = new_by_call_latest
+        self.by_band_grid4 = {
+            k: {
+                "count": len(snrs),
+                "avg_snr": round(sum(snrs) / len(snrs), 1),
+                "max_snr": max(snrs),
+                "min_snr": min(snrs),
+            }
+            for k, snrs in grid4_acc.items()
+        }
+        self.by_band_grid2 = {
+            k: {
+                "count": len(snrs),
+                "avg_snr": round(sum(snrs) / len(snrs), 1),
+                "max_snr": max(snrs),
+                "min_snr": min(snrs),
+            }
+            for k, snrs in grid2_acc.items()
+        }
+        self.band_counts = new_band_counts
+        self.total_spots = len(self._spots)
+        return len(expired_keys)
+
+    def _load_cache(self):
+        if not self.cache_path or not os.path.exists(self.cache_path):
+            return
+        try:
+            with open(self.cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cached_call = str(data.get("callsign", "")).strip().upper()
+            if cached_call != self.callsign:
+                return
+            now = time.time()
+            cutoff = now - self.window_s
+            loaded = 0
+            for sp in data.get("spots", []):
+                rcall = str(sp.get("call", "")).strip().upper()
+                band = str(sp.get("band", "")).strip()
+                flow_sec = int(sp.get("flow_sec", 0) or 0)
+                if not rcall or not band or flow_sec < cutoff:
+                    continue
+                band_key = band.lower()
+                prev = self._spots.get((rcall, band_key))
+                if prev is None or flow_sec > prev["flow_sec"]:
+                    self._spots[(rcall, band_key)] = {
+                        "call": rcall,
+                        "grid": str(sp.get("grid", "")).strip().upper(),
+                        "snr": int(sp.get("snr", -99)),
+                        "freq_hz": float(sp.get("freq_hz", 0.0) or 0.0),
+                        "band": band,
+                        "flow_sec": flow_sec,
+                        "age_min": max(0, round((now - flow_sec) / 60.0)),
+                    }
+                    loaded += 1
+            with self.lock:
+                self.last_poll_time = float(data.get("last_poll_time", 0.0) or 0.0)
+                if self.last_poll_time > now:
+                    self.last_poll_time = 0.0
+                self.last_update_utc = str(data.get("last_update_utc", "") or "")
+                if self.last_poll_time > 0:
+                    self.last_poll_status = "ok"
+                self._rebuild_indexes_locked(now)
+                self._last_cache_save = now
+            if loaded > 0:
+                print(f"[PSKReporter] Restored {self.total_spots} warm spots for {self.callsign} from cache")
+        except Exception as e:
+            print(f"[PSKReporter] Warning loading cache {self.cache_path}: {e}")
+
+    def _save_cache_locked(self, now: float):
+        if not self.cache_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
+            payload = {
+                "callsign": self.callsign,
+                "last_poll_time": self.last_poll_time,
+                "last_update_utc": self.last_update_utc,
+                "spots": list(self._spots.values()),
+            }
+            tmp_path = self.cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, self.cache_path)
+            self._cache_dirty = False
+            self._last_cache_save = now
+        except Exception as e:
+            print(f"[PSKReporter] Warning saving cache {self.cache_path}: {e}")
+
+    def prune_and_flush(self) -> bool:
+        """Prunes expired (>60m) spots and flushes dirty cache to disk. Returns True if spots changed."""
+        now = time.time()
+        with self.lock:
+            expired = self._rebuild_indexes_locked(now)
+            if expired > 0:
+                self._cache_dirty = True
+            if self._cache_dirty and (now - self._last_cache_save >= 30.0):
+                self._save_cache_locked(now)
+            return expired > 0
+
+    def ingest_mqtt_spot(self, s: Dict[str, Any]) -> bool:
+        """Merges a single live JSON spot from PSKReporter MQTT v2 stream."""
+        if not isinstance(s, dict):
+            return False
+        sc = str(s.get("sc") or "").strip().upper()
+        rcall = str(s.get("rc") or "").strip().upper()
+        if not sc or not rcall:
+            return False
+
+        now = time.time()
+        with self.lock:
+            if sc != self.callsign:
+                return False
+
+            rgrid = str(s.get("rl") or "").strip().upper()
+            try:
+                freq_hz = float(s.get("f") or 0)
+            except (ValueError, TypeError):
+                freq_hz = 0.0
+            try:
+                rp_val = s.get("rp")
+                snr = int(rp_val) if rp_val is not None else -99
+            except (ValueError, TypeError):
+                snr = -99
+            try:
+                t_raw = s.get("t") or s.get("t_tx") or int(now)
+                flow_sec = min(int(t_raw), int(now))
+            except (ValueError, TypeError):
+                flow_sec = int(now)
+
+            if flow_sec < (now - self.window_s):
+                return False
+
+            band = get_band_name(freq_hz / 1e6) if freq_hz > 0 else (str(s.get("b") or "unknown").strip() or "unknown")
+            band_key = band.lower()
+            key = (rcall, band_key)
+
+            old = self._spots.get(key)
+            if old is not None:
+                if old["flow_sec"] > flow_sec:
+                    return False
+                if old["flow_sec"] == flow_sec and old["snr"] == snr:
+                    return False
+                if not rgrid and old.get("grid"):
+                    rgrid = old["grid"]
+
+            self._spots[key] = {
+                "call": rcall,
+                "grid": rgrid,
+                "snr": snr,
+                "freq_hz": freq_hz,
+                "band": band,
+                "flow_sec": flow_sec,
+                "age_min": max(0, round((now - flow_sec) / 60.0)),
+            }
+            self.mqtt_spots_rx += 1
+            self.last_spot_time = now
+            self.last_update_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            self._rebuild_indexes_locked(now)
+            self._rescore_needed = True
+            self._cache_dirty = True
+            return True
 
     def fetch_reports(self, callsign: Optional[str] = None) -> bool:
         target_call = (callsign or self.callsign).strip().upper()
         if not target_call:
             return False
-            
+
         url = (
             f"https://retrieve.pskreporter.info/query"
-            f"?senderCallsign={target_call}"
-            f"&flowStartSeconds=-3600"
+            f"?senderCallsign={urllib.parse.quote(target_call)}"
+            f"&flowStartSeconds=-{int(self.window_s)}"
             f"&statistics=1"
         )
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "WSJTX-QSO-Companion/1.0 (Amateur Radio QSO Success Estimator)"}
+            headers={"User-Agent": "WSJTX-QSO-Companion/1.1 (Amateur Radio QSO Success Estimator)"}
         )
-        
+
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
-            # Reset backoff on success
-            self.backoff_factor = 1.0
+            self.backoff_factor = 60.0
             self.next_retry_time = 0.0
         except HTTPError as he:
             with self.lock:
@@ -1143,9 +1653,9 @@ class PskReporterManager:
                         wait = self.backoff_factor
                 else:
                     wait = self.backoff_factor
-                self.backoff_factor = min(self.backoff_factor * 2, 3600)
+                self.backoff_factor = min(self.backoff_factor * 2, 3600.0)
                 self.next_retry_time = time.time() + wait
-                print(f"[PSKReporter] Rate limited (429) for {target_call}, backing off {wait}s")
+                print(f"[PSKReporter] Rate limited (429) for {target_call}, backing off {int(wait)}s (MQTT live={self.mqtt_connected})")
             else:
                 print(f"[PSKReporter] Query failed for {target_call}: HTTP {he.code}: {he.reason}")
             return False
@@ -1165,124 +1675,100 @@ class PskReporterManager:
             print(f"[PSKReporter] XML parse error: {e}")
             return False
 
-        # Extract reception reports from XML
         reports_raw = list(root.findall("receptionReport"))
         now = time.time()
-        
-        new_by_call_band: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        new_by_call_latest: Dict[str, Dict[str, Any]] = {}
-        grid4_acc: Dict[Tuple[str, str], List[int]] = {}
-        grid2_acc: Dict[Tuple[str, str], List[int]] = {}
-        new_band_counts: Dict[str, int] = {}
-
-        for r in reports_raw:
-            rcall = str(r.get("receiverCallsign", "")).strip().upper()
-            if not rcall:
-                continue
-            rgrid = str(r.get("receiverLocator", "")).strip().upper()
-            try:
-                freq_hz = float(r.get("frequency", 0) or 0)
-            except (ValueError, TypeError):
-                freq_hz = 0.0
-            try:
-                snr = int(r.get("sNR", -99) or -99)
-            except (ValueError, TypeError):
-                snr = -99
-            try:
-                flow_sec = int(r.get("flowStartSeconds", 0) or 0)
-            except (ValueError, TypeError):
-                flow_sec = int(now)
-
-            band = get_band_name(freq_hz / 1e6) if freq_hz > 0 else "unknown"
-            new_band_counts[band] = new_band_counts.get(band, 0) + 1
-
-            spot = {
-                "call": rcall,
-                "grid": rgrid,
-                "snr": snr,
-                "freq_hz": freq_hz,
-                "band": band,
-                "flow_sec": flow_sec,
-                "age_min": max(0, round((now - flow_sec) / 60.0))
-            }
-
-            # Keyed by (call, band) - keep most recent
-            call_band_key = (rcall, band)
-            if call_band_key not in new_by_call_band or flow_sec > new_by_call_band[call_band_key]["flow_sec"]:
-                new_by_call_band[call_band_key] = spot
-
-            # Keyed by call - keep most recent across all bands
-            if rcall not in new_by_call_latest or flow_sec > new_by_call_latest[rcall]["flow_sec"]:
-                new_by_call_latest[rcall] = spot
-
-            # Regional accumulation
-            if len(rgrid) >= 4:
-                g4 = (band, rgrid[:4])
-                grid4_acc.setdefault(g4, []).append(snr)
-            if len(rgrid) >= 2:
-                g2 = (band, rgrid[:2])
-                grid2_acc.setdefault(g2, []).append(snr)
-
-        # Summarize regional grids
-        new_grid4: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for (b, g4), snrs in grid4_acc.items():
-            new_grid4[(b, g4)] = {
-                "count": len(snrs),
-                "avg_snr": round(sum(snrs) / len(snrs), 1),
-                "max_snr": max(snrs),
-                "min_snr": min(snrs)
-            }
-
-        new_grid2: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for (b, g2), snrs in grid2_acc.items():
-            new_grid2[(b, g2)] = {
-                "count": len(snrs),
-                "avg_snr": round(sum(snrs) / len(snrs), 1),
-                "max_snr": max(snrs),
-                "min_snr": min(snrs)
-            }
+        cutoff = now - self.window_s
 
         with self.lock:
-            self.callsign = target_call
-            self.total_spots = len(reports_raw)
+            if target_call != self.callsign:
+                self.callsign = target_call
+                self._spots.clear()
+
+            for r in reports_raw:
+                rcall = str(r.get("receiverCallsign", "")).strip().upper()
+                if not rcall:
+                    continue
+                rgrid = str(r.get("receiverLocator", "")).strip().upper()
+                try:
+                    freq_hz = float(r.get("frequency", 0) or 0)
+                except (ValueError, TypeError):
+                    freq_hz = 0.0
+                try:
+                    snr = int(r.get("sNR", -99) or -99)
+                except (ValueError, TypeError):
+                    snr = -99
+                try:
+                    flow_sec = int(r.get("flowStartSeconds", 0) or 0)
+                except (ValueError, TypeError):
+                    flow_sec = int(now)
+
+                if flow_sec < cutoff:
+                    continue
+
+                band = get_band_name(freq_hz / 1e6) if freq_hz > 0 else "unknown"
+                band_key = band.lower()
+                key = (rcall, band_key)
+
+                # Merge like pskmap.js mergeData(): preserve live MQTT spots newer than HTTP DB snapshot
+                existing = self._spots.get(key)
+                if existing is not None:
+                    if existing["flow_sec"] > flow_sec:
+                        if not existing.get("grid") and rgrid:
+                            existing["grid"] = rgrid
+                        continue
+                    if not rgrid and existing.get("grid"):
+                        rgrid = existing["grid"]
+
+                self._spots[key] = {
+                    "call": rcall,
+                    "grid": rgrid,
+                    "snr": snr,
+                    "freq_hz": freq_hz,
+                    "band": band,
+                    "flow_sec": flow_sec,
+                    "age_min": max(0, round((now - flow_sec) / 60.0)),
+                }
+
+            self._rebuild_indexes_locked(now)
             self.last_poll_time = now
             self.last_poll_status = "ok"
             self.last_poll_error = ""
             self.last_update_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-            self.by_call_band = new_by_call_band
-            self.by_call_latest = new_by_call_latest
-            self.by_band_grid4 = new_grid4
-            self.by_band_grid2 = new_grid2
-            self.band_counts = new_band_counts
+            self._rescore_needed = False
+            self._save_cache_locked(now)
+            total = self.total_spots
+            bands_snapshot = dict(self.band_counts)
 
-        print(f"[PSKReporter] Updated for {target_call}: {len(reports_raw)} spots across {len(new_band_counts)} bands ({dict(new_band_counts)})")
+        print(f"[PSKReporter] HTTP sync for {target_call}: {total} active spots ({len(reports_raw)} in XML) across {len(bands_snapshot)} bands ({bands_snapshot})")
         return True
 
     def lookup(self, call: str, grid: str, current_band: str) -> Dict[str, Any]:
         c = call.strip().upper()
         g = grid.strip().upper()
         b = current_band.strip().lower()
+        now = time.time()
+        cutoff = now - self.window_s
 
         with self.lock:
             # 1. Exact direct match on active band
             direct_band = self.by_call_band.get((c, b))
-            if direct_band:
+            if direct_band and direct_band["flow_sec"] >= cutoff:
                 return {
                     "match": "direct_band",
                     "snr": direct_band["snr"],
                     "band": direct_band["band"],
-                    "age_min": direct_band["age_min"],
+                    "age_min": max(0, round((now - direct_band["flow_sec"]) / 60.0)),
                     "grid": direct_band["grid"]
                 }
 
             # 2. Exact direct match on another band
             direct_any = self.by_call_latest.get(c)
-            if direct_any:
+            if direct_any and direct_any["flow_sec"] >= cutoff:
                 return {
                     "match": "direct_other",
                     "snr": direct_any["snr"],
                     "band": direct_any["band"],
-                    "age_min": direct_any["age_min"],
+                    "age_min": max(0, round((now - direct_any["flow_sec"]) / 60.0)),
                     "grid": direct_any["grid"]
                 }
 
@@ -1318,15 +1804,23 @@ class PskReporterManager:
         with self.lock:
             now = time.time()
             age_s = max(0, int(now - self.last_poll_time)) if self.last_poll_time > 0 else None
-            age_str = f"{round(age_s / 60)}m ago" if age_s is not None else "never"
+            http_age_str = f"{round(age_s / 60)}m ago" if age_s is not None else "never"
+            mqtt_live = bool(self.mqtt_connected and self.mqtt_subscribed_topic)
+            spot_age_s = max(0, int(now - self.last_spot_time)) if self.last_spot_time > 0 else None
             return {
                 "callsign": self.callsign,
                 "total_spots": self.total_spots,
                 "last_update_utc": self.last_update_utc,
                 "last_poll_time": self.last_poll_time,
                 "age_seconds": age_s,
-                "age_str": age_str,
-                "status": self.last_poll_status,
+                "age_str": "LIVE" if mqtt_live else http_age_str,
+                "http_age_str": http_age_str,
+                "status": "live" if mqtt_live else self.last_poll_status,
+                "mqtt_live": mqtt_live,
+                "mqtt_broker": self.mqtt_broker_label,
+                "mqtt_topic": self.mqtt_subscribed_topic,
+                "mqtt_spots_rx": self.mqtt_spots_rx,
+                "last_spot_age_s": spot_age_s,
                 "band_counts": dict(self.band_counts)
             }
 
@@ -1954,7 +2448,7 @@ def udp_listener_thread():
                             if de_call:
                                 state.de_call = de_call
                                 if state.psk_manager:
-                                    state.psk_manager.callsign = de_call
+                                    state.psk_manager.set_callsign(de_call)
                             if de_grid: state.de_grid = de_grid
                             state.dx_call = dx_call
                             state.dx_grid = dx_grid
@@ -1999,9 +2493,137 @@ def space_weather_poller():
             print(f"[SpaceWeather] Error: {e}")
         time.sleep(1800) # update every 30 minutes
 
+def psk_mqtt_streamer():
+    """
+    Maintains a persistent live MQTT subscription to PSKReporter's v2 spot feed
+    (mirroring pskreporter.info/pskmap.html), feeding spots into PskReporterManager
+    within seconds of decode cycle completion.
+    """
+    endpoints = _parse_psk_mqtt_endpoints()
+    ep_idx = 0
+    backoff_s = 2.0
+
+    while True:
+        with state.lock:
+            enabled = state.psk_reporter
+            callsign = (state.de_call or DEFAULT_MY_CALL).strip().upper()
+            mgr = state.psk_manager
+
+        if not enabled or not mgr or not mgr.can_stream_mqtt(callsign):
+            if mgr:
+                mgr.set_mqtt_state(False)
+            if mgr:
+                mgr.wake_event.wait(timeout=2.0)
+                mgr.wake_event.clear()
+            else:
+                time.sleep(2.0)
+            continue
+
+        host, port, mode, ws_path = endpoints[ep_idx % len(endpoints)]
+        broker_label = f"{host}:{port}"
+        wire = _PskMqttWire(host, port, mode=mode, ws_path=ws_path, timeout=15.0)
+        pkt_id = 1
+        subscribed_topic = ""
+
+        try:
+            wire.connect_socket()
+            client_id = f"wsjtx-qso-{os.getpid()}-{int(time.time() * 1000) % 100000}"
+            wire.send_mqtt(_PskMqttWire.build_connect(client_id, keepalive=60))
+            pt, body = wire.read_packet()
+            if pt != 0x20 or len(body) < 2 or body[1] != 0x00:
+                rc = body[1] if len(body) >= 2 else -1
+                raise ConnectionError(f"MQTT CONNACK rejected (type=0x{pt:02x}, rc={rc})")
+
+            subscribed_topic = mgr.topic_for_callsign(callsign)
+            wire.send_mqtt(_PskMqttWire.build_subscribe(pkt_id, subscribed_topic, qos=0))
+            pkt_id = (pkt_id % 65530) + 1
+            pt, body = wire.read_packet()
+            if pt != 0x90 or (len(body) >= 3 and body[2] == 0x80):
+                raise ConnectionError(f"MQTT SUBACK rejected for {subscribed_topic}")
+
+            mgr.set_mqtt_state(True, broker_label=broker_label, topic=subscribed_topic)
+            print(f"[PSKReporter-MQTT] Live stream connected ({broker_label}, {mode.upper()}) -> {subscribed_topic}")
+            backoff_s = 2.0
+            now = time.time()
+            last_ping = now
+            last_rx = now
+
+            while True:
+                with state.lock:
+                    cur_enabled = state.psk_reporter
+                    cur_call = (state.de_call or DEFAULT_MY_CALL).strip().upper()
+
+                if not cur_enabled or not mgr.can_stream_mqtt(cur_call):
+                    try:
+                        wire.send_mqtt(b"\xe0\x00")  # MQTT DISCONNECT
+                    except Exception:
+                        pass
+                    break
+
+                desired_topic = mgr.topic_for_callsign(cur_call)
+                if desired_topic != subscribed_topic:
+                    wire.send_mqtt(_PskMqttWire.build_unsubscribe(pkt_id, subscribed_topic))
+                    pkt_id = (pkt_id % 65530) + 1
+                    wire.send_mqtt(_PskMqttWire.build_subscribe(pkt_id, desired_topic, qos=0))
+                    pkt_id = (pkt_id % 65530) + 1
+                    subscribed_topic = desired_topic
+                    mgr.set_mqtt_state(True, broker_label=broker_label, topic=subscribed_topic)
+                    print(f"[PSKReporter-MQTT] Switched subscription -> {subscribed_topic}")
+
+                if wire.wait_readable(timeout_s=2.0):
+                    pt, body = wire.read_packet()
+                    last_rx = time.time()
+                    top_nibble = pt & 0xF0
+                    if top_nibble == 0x30:  # PUBLISH
+                        if len(body) >= 2:
+                            tlen = struct.unpack_from(">H", body, 0)[0]
+                            qos = (pt >> 1) & 0x03
+                            off = 2 + tlen
+                            if qos > 0 and off + 2 <= len(body):
+                                pub_id = struct.unpack_from(">H", body, off)[0]
+                                off += 2
+                                if qos == 1:
+                                    wire.send_mqtt(b"\x40\x02" + struct.pack(">H", pub_id))
+                            if off <= len(body):
+                                raw_json = body[off:].decode("utf-8", errors="replace")
+                                try:
+                                    spot_obj = json.loads(raw_json)
+                                    mgr.ingest_mqtt_spot(spot_obj)
+                                except ValueError:
+                                    pass
+                    elif pt == 0xD0:  # PINGRESP
+                        pass
+
+                now = time.time()
+                if now - last_ping >= 25.0:
+                    wire.send_mqtt(b"\xc0\x00")  # PINGREQ
+                    last_ping = now
+                if now - last_rx >= 75.0:
+                    raise TimeoutError("MQTT keepalive timeout (no packets in 75s)")
+
+        except Exception as e:
+            print(f"[PSKReporter-MQTT] Stream disconnected ({broker_label}): {e}; retrying in {int(backoff_s)}s")
+            ep_idx += 1
+            mgr.set_mqtt_state(False)
+            wire.close()
+            mgr.wake_event.wait(timeout=backoff_s)
+            mgr.wake_event.clear()
+            backoff_s = min(backoff_s * 2.0, 30.0)
+            continue
+
+        mgr.set_mqtt_state(False)
+        wire.close()
+
+
 def psk_reporter_poller():
-    """Background poller for PSK Reporter ground-truth reception reports."""
-    time.sleep(2)
+    """
+    Housekeeping & HTTP seed/fallback loop for PSK Reporter ground-truth:
+      - Rescores active decodes within <=1s when live MQTT spots arrive.
+      - Runs initial 60m HTTP seed and 15m background HTTP refresh (or 5m if MQTT is offline).
+      - Prunes >60m spots, flushes warm disk cache, and checks QSO completions.
+    """
+    time.sleep(1.5)
+    last_housekeeping = 0.0
     while True:
         try:
             with state.lock:
@@ -2009,16 +2631,25 @@ def psk_reporter_poller():
                 callsign = state.de_call or DEFAULT_MY_CALL
                 mgr = state.psk_manager
 
-            if enabled and mgr and mgr.should_poll():
-                if mgr.fetch_reports(callsign):
-                    rescore_all_decodes()
-            
-            # Check for completed QSOs
-            if state.qso_tracker:
-                state.qso_tracker.check_completions(state.log_watcher)
+            if enabled and mgr and mgr.consume_rescore_needed():
+                rescore_all_decodes()
+
+            now = time.time()
+            if now - last_housekeeping >= 5.0:
+                last_housekeeping = now
+                if enabled and mgr:
+                    if mgr.should_poll():
+                        if mgr.fetch_reports(callsign):
+                            rescore_all_decodes()
+                    elif mgr.prune_and_flush():
+                        rescore_all_decodes()
+
+                # Check for completed QSOs
+                if state.qso_tracker:
+                    state.qso_tracker.check_completions(state.log_watcher)
         except Exception as e:
             print(f"[PSKReporter] Poller loop error: {e}")
-        time.sleep(10)
+        time.sleep(1.0)
 
 # -----------------------------------------------------------------------------
 # Web Request Handler & REST API
@@ -2358,7 +2989,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         new_val = bool(params["psk_reporter"])
                         state.psk_reporter = new_val
                         rescore_all_decodes()
-                        if new_val and state.psk_manager and (time.time() - state.psk_manager.last_poll_time > 300.0):
+                        if state.psk_manager:
+                            state.psk_manager.wake_event.set()
+                        if new_val and state.psk_manager and state.psk_manager.should_poll():
                             target_c = state.de_call or DEFAULT_MY_CALL
                             mgr = state.psk_manager
                             def _fetch_bg():
@@ -2419,6 +3052,9 @@ def main():
     
     t_psk = threading.Thread(target=psk_reporter_poller, daemon=True)
     t_psk.start()
+
+    t_psk_mqtt = threading.Thread(target=psk_mqtt_streamer, daemon=True)
+    t_psk_mqtt.start()
     
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), DashboardHandler)
